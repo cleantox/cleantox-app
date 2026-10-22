@@ -21,6 +21,11 @@ from parser_servicios import es_servicio, parsear_evento
 
 TZ = ZoneInfo("America/Mexico_City")
 st.set_page_config(page_title="CleanTox · Servicios", page_icon="🧽", layout="wide")
+st.markdown(
+    "<style>[data-testid='stToolbar'],[data-testid='stDecoration'],.stAppDeployButton,"
+    "[data-testid='stMainMenu']{display:none!important}</style>",
+    unsafe_allow_html=True,
+)
 
 
 # ------------------------------------------------------------------ configuración
@@ -144,6 +149,11 @@ def vista_coordinadora(qp) -> None:
     for p in mios:
         st.caption(md(f"Ya reportado: {pesos(p['Monto'])} por {p.get('Registró', '')} · {p.get('Registrado', '')}"))
 
+    aviso = st.session_state.pop("aviso_registro", None)
+    if aviso:
+        st.success(aviso)
+        st.balloons()
+
     if pendiente != 0:
         st.subheader("Registrar efectivo recibido")
         with st.form("efectivo", clear_on_submit=True):
@@ -183,8 +193,9 @@ def vista_coordinadora(qp) -> None:
                     )
                 except Exception:
                     st.warning("Se guardó, pero no se pudo mandar el aviso por correo. Avisa a la oficina.")
-                st.success(f"Listo. Se registraron {pesos(monto)} y se avisó a la oficina. Folio {pid}.")
-                st.balloons()
+                st.session_state["aviso_registro"] = (
+                    f"Listo. Se registraron {pesos(monto)} y se avisó a la oficina. Folio {pid}.")
+                st.rerun()
 
 
 # =================================================================== OFICINA
@@ -255,12 +266,13 @@ def vista_oficina() -> None:
     reportado = g.sumar(pagos_dia, g.REPORTADO)
     por_cobrar = sum(saldo(s, lista) or 0 for s in servicios)
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3 = st.columns(3)
     c1.metric("Servicios", len(servicios))
     c2.metric("Venta del día", pesos(venta))
-    c3.metric("Cobrado (anticipos + confirmado)", pesos(anticipos + confirmado))
-    c4.metric("Efectivo sin confirmar", pesos(reportado))
-    c5.metric("Por cobrar", pesos(por_cobrar))
+    c3.metric("Por cobrar", pesos(por_cobrar))
+    c4, c5, _ = st.columns(3)
+    c4.metric("Cobrado (anticipos + confirmado)", pesos(anticipos + confirmado))
+    c5.metric("Efectivo sin confirmar", pesos(reportado))
 
     if not servicios:
         st.info("No hay servicios este día en el calendario Servicios CleanTox.")
@@ -314,7 +326,9 @@ def tarjeta(s, lista: list[dict], usuario: str) -> None:
                          f"Aquí ves la dirección, lo que se hace y cuánto cobrar: {link}")
                 st.link_button("Mandar por WhatsApp", "https://wa.me/?text=" + urllib.parse.quote(texto),
                                width="stretch")
-                st.code(link, language=None)
+                st.caption("¿Usas WhatsApp Web en otro navegador? Copia el mensaje con el ícono 📋 "
+                           "(esquina del recuadro) y pégalo en el chat:")
+                st.code(texto, language=None, wrap_lines=True)
                 st.caption("El link solo muestra este servicio, sin teléfono del cliente, "
                            "y deja de funcionar al terminar el día del servicio.")
 
