@@ -20,7 +20,8 @@ import google_api as g
 from parser_servicios import es_servicio, parsear_evento
 
 TZ = ZoneInfo("America/Mexico_City")
-st.set_page_config(page_title="CleanTox · Servicios", page_icon="🧽", layout="wide")
+st.set_page_config(page_title="CleanTox · Servicios", page_icon="icono.png", layout="wide")
+st.logo("logo.png", icon_image="icono.png", size="large")
 st.markdown(
     "<style>[data-testid='stToolbar'],[data-testid='stDecoration'],.stAppDeployButton,"
     "[data-testid='stMainMenu']{display:none!important}</style>",
@@ -108,13 +109,13 @@ def fecha_servicio(s) -> date:
 def vista_coordinadora(qp) -> None:
     ok, motivo = enlaces.verificar(LINK_SECRET, qp.get("s", ""), qp.get("d", ""), qp.get("k", ""))
     if not ok:
-        st.title("🧽 CleanTox")
+        st.image("logo.png", width=220)
         st.error(motivo)
         st.stop()
 
     ev = evento(qp["s"])
     if not ev:
-        st.title("🧽 CleanTox")
+        st.image("logo.png", width=220)
         st.error("Este servicio ya no existe o fue cancelado. Comunícate con la oficina.")
         st.stop()
 
@@ -204,7 +205,8 @@ def usuario_oficina() -> str:
     if MODO_LOCAL:
         return "local"
     if not st.user.get("is_logged_in", False):
-        st.title("🧽 CleanTox · Servicios")
+        st.image("logo.png", width=260)
+        st.title("Servicios")
         st.write("Acceso para la oficina con tu cuenta **@cleantox.mx**.")
         if st.button("Iniciar sesión con Google", type="primary"):
             st.login()
@@ -223,7 +225,6 @@ def vista_oficina() -> None:
     lista = pagos()
 
     with st.sidebar:
-        st.header("🧽 CleanTox")
         st.caption(usuario)
         dia = st.date_input("Día", value=datetime.now(TZ).date(), format="DD/MM/YYYY")
         mostrar_todo = st.toggle("Mostrar también eventos que no son servicios", value=False)
