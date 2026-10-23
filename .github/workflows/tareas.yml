@@ -1,0 +1,34 @@
+name: Tareas CleanTox
+
+on:
+  schedule:
+    - cron: "*/15 13-23 * * *"   # retrasos, cada 15 min de 7:00 a 17:59 (hora CDMX)
+    - cron: "*/15 0-2 * * *"     # retrasos, de 18:00 a 20:59 (hora CDMX)
+    - cron: "0 14 * * 1"         # reporte semanal, lunes 8:00 (hora CDMX)
+  workflow_dispatch:
+    inputs:
+      modo:
+        description: "retrasos o reporte"
+        default: "reporte"
+
+jobs:
+  correr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install google-api-python-client google-auth google-auth-oauthlib tzdata
+      - name: Correr tarea
+        env:
+          STREAMLIT_SECRETS: ${{ secrets.STREAMLIT_SECRETS }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            python tareas.py "${{ github.event.inputs.modo }}"
+          elif [ "${{ github.event.schedule }}" = "0 14 * * 1" ]; then
+            python tareas.py reporte
+          else
+            python tareas.py retrasos
+          fi
