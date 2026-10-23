@@ -8,6 +8,7 @@ CleanTox · Servicios (versión web)
 
 from __future__ import annotations
 
+import re
 import urllib.parse
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -270,6 +271,10 @@ def vista_coordinadora(qp) -> None:
     if not s.conceptos:
         st.caption("Sin detalle en el evento. Confirma con la oficina.")
 
+    # ---------------- piezas (lavado / tapetes): ajustar cantidades
+    if any(t in s.tipo_servicio for t in ("Lavado de tapicería", "Entrega de tapete")):
+        ajustar_piezas(s, quien, hora)
+
     # ---------------- fotos
     if not s.no_fotos:
         fotos(s, "Antes", "4 · Fotos de antes")
@@ -336,8 +341,11 @@ def vista_coordinadora(qp) -> None:
         c1, c2 = st.columns(2)
         c1.metric("Si paga en efectivo", pesos(ec["efectivo"]))
         c2.metric("Si paga con transferencia o terminal", pesos(ec["transferencia"]))
-        if ec["extras_por_aprobar"]:
+        if ec["extras_por_aprobar"] > 0:
             st.caption(f"Hay {pesos(ec['extras_por_aprobar'])} + IVA en extras esperando aprobación (aún no se suman).")
+        elif ec["extras_por_aprobar"] < 0:
+            st.caption(f"Hay piezas quitadas por {pesos(-ec['extras_por_aprobar'])} + IVA esperando aprobación "
+                       f"(el saldo todavía no baja).")
         metodo = st.radio("¿Cómo pagó?", METODOS, horizontal=True, key="metodo_cobro")
         sugerido = ec["efectivo"] if metodo == "Efectivo" else ec["transferencia"]
         with st.form("cobro", clear_on_submit=True):
@@ -386,6 +394,50 @@ def vista_coordinadora(qp) -> None:
         return
     st.caption(f"🏁 Salida registrada a las {hhmm(horas['salida'])}")
     formulario_cierre(s, quien, ec)
+
+
+def ajustar_piezas(s, quien: str, hora: str) -> None:
+    piezas = [c for c in s.conceptos if c.monto_unitario is not None
+              and not (s.cobro_en_entrega and re.search(r"tapete|alfombra", c.texto, re.I))]
+    if not piezas:
+        return
+    ajustes = [e for e in g.de_evento(tabla("Extras servicio"), s.event_id)
+               if e.get("Tipo") == "Ajuste" and e.get("Estado") != "Rechazado"]
+    with st.expander("🧮 Piezas: ¿se lavó todo lo cotizado?"):
+        st.caption("Corrige la cantidad si el cliente agregó o quitó piezas. Si quitas piezas, la oficina "
+                   "lo tiene que aprobar antes de bajar el cobro.")
+        nuevos = {}
+        for i, c in enumerate(piezas):
+            ya = sum(g.numero(e.get("Cantidad")) for e in ajustes if e.get("Concepto") == c.texto)
+            actual = c.cantidad + ya
+            nuevos[i] = (c, actual, st.number_input(f"{c.texto} · cotizado {c.cantidad} · {pesos(c.monto_unitario)} c/u",
+                                                     min_value=0.0, value=float(actual), step=1.0, key=f"pz_{i}"))
+        if st.button("Guardar cantidades", key="pz_guardar"):
+            gg = google()
+            hubo = False
+            for c, actual, nuevo in nuevos.values():
+                delta = round(nuevo - actual, 2)
+                if not delta:
+                    continue
+                hubo = True
+                estado = "Aprobado" if delta > 0 else "Por aprobar"
+                gg.agregar(SHEET_ID, "Extras servicio", {
+                    "Event ID": s.event_id, "Fecha servicio": fecha_servicio(s).isoformat(), "Cliente": s.cliente,
+                    "Concepto": c.texto, "Cantidad": delta, "Precio sin IVA": c.monto_unitario,
+                    "Importe sin IVA": round(delta * c.monto_unitario, 2), "Tipo": "Ajuste", "Estado": estado,
+                    "Registró": quien})
+                if delta < 0:
+                    try:
+                        gg.enviar_correo(APROBADORES, f"⏳ Piezas quitadas por aprobar – {s.cliente}",
+                                         f"{quien} bajó la cantidad de '{c.texto}' en {abs(delta):g} "
+                                         f"({pesos(abs(delta) * c.monto_unitario)} sin IVA menos).\n"
+                                         f"Cliente: {s.cliente} · {hora}\n\nAprueba o rechaza en: {APP_URL}\n")
+                    except Exception:
+                        pass
+            if hubo:
+                refrescar()
+                st.session_state["aviso"] = "Cantidades guardadas."
+                st.rerun()
 
 
 def fotos(s, sub: str, titulo: str) -> None:
@@ -494,7 +546,8 @@ def vista_comprobante(qp) -> None:
     if extras_ok:
         st.subheader("Trabajos adicionales")
         for e in extras_ok:
-            st.markdown(f"- {md(e.get('Concepto'))} × {e.get('Cantidad')}")
+            n = g.numero(e.get("Cantidad"))
+            st.markdown(f"- {'Menos: ' if n < 0 else ''}{md(e.get('Concepto'))} × {abs(n):g}")
     st.subheader("Pagos")
     pagado = sum(p["Monto"] for p in g.pagos_de_evento(tabla("Pagos"), s.event_id)) + (s.anticipo or 0)
     st.markdown(f"Pagado: **{pm(pagado)}**")
@@ -609,8 +662,9 @@ def alertas_oficina(servicios: list, dia: date, usuario: str) -> None:
         with st.expander(f"⏳ Extras por aprobar ({len(por_aprobar)})", expanded=True):
             for e in por_aprobar:
                 c1, c2, c3 = st.columns([5, 1, 1])
-                c1.markdown(md(f"**{e.get('Concepto')}** × {e.get('Cantidad')} = "
-                               f"{pesos(g.numero(e.get('Importe sin IVA')))} + IVA · {e.get('Cliente')} · "
+                quitar = g.numero(e.get("Cantidad")) < 0
+                c1.markdown(md(f"{'➖ Quitar ' if quitar else ''}**{e.get('Concepto')}** × {abs(g.numero(e.get('Cantidad'))):g} = "
+                               f"{'−' if quitar else ''}{pesos(abs(g.numero(e.get('Importe sin IVA'))))} + IVA · {e.get('Cliente')} · "
                                f"{e.get('Registró')}"))
                 if puede_aprobar(usuario):
                     for col, est, k in ((c2, "Aprobado", "ap"), (c3, "Rechazado", "re")):
