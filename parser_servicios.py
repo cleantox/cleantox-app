@@ -27,6 +27,8 @@ CODIGOS_SERVICIO = {
     "POST OBRA": "Post obra",
     "ENT TAP": "Entrega de tapete",
     "REC TAP": "Recoger tapete",
+    "PREMUD": "Pre mudanza",
+    "PREMUDANZA": "Pre mudanza",
     "PRE": "Pre mudanza",
     "POST": "Post obra",
     "LIMPINT": "Limpieza integral",
@@ -95,6 +97,14 @@ class Servicio:
     restan_en_evento: Optional[float] = None
     anticipo: float = 0.0
     anticipo_marcado: bool = False   # ✅ en el título
+    anticipo_metodo: str = ""        # Efectivo / Transferencia / Terminal / "" (no dice)
+    base: Optional[float] = None     # precio del servicio SIN IVA (lo que se usa para cobrar)
+    base_fuente: str = ""
+    paga_efectivo: bool = False      # la descripción dice "paga en efectivo"
+    no_fotos: bool = False           # la descripción menciona FOTOS -> no autoriza
+    metros: str = ""
+    banos: str = ""
+    descripcion: str = ""
     liquidado_en_calendario: bool = False
     alertas: list[str] = field(default_factory=list)
     link_calendar: str = ""
@@ -122,6 +132,17 @@ class Servicio:
 
 
 # ---------------------------------------------------------------- utilidades
+
+def metodo_de(texto: str) -> str:
+    t = texto.lower()
+    if re.search(r"\befe(ctivo)?\b|cash", t):
+        return "Efectivo"
+    if re.search(r"terminal|clip|tarjeta", t):
+        return "Terminal"
+    if re.search(r"transf|spei|dep[oó]sito|banbaj|bankaol|bancaria", t):
+        return "Transferencia"
+    return ""
+
 
 def _a_numero(texto: str) -> float:
     return float(texto.replace(",", ""))
@@ -163,6 +184,11 @@ def parsear_titulo(titulo: str) -> tuple[str, list[str], str]:
     nombre = re.sub(r"\s*\d{1,2}(:\d{2})?\s*(a\.?\s?m\.?|p\.?\s?m\.?|hrs?)\.?", " ", nombre, flags=re.I)
     nombre = re.sub(r"[^\w\s.'\-áéíóúñÁÉÍÓÚÑüÜ]", "", nombre)
     nombre = " ".join(nombre.split()).title() if nombre.islower() else " ".join(nombre.split())
+    # Palabras en MAYÚSCULAS al final del nombre son notas (p.ej. "PUNTUAL")
+    partes = nombre.split()
+    while len(partes) > 1 and partes[-1].isupper() and len(partes[-1]) >= 3:
+        partes.pop()
+    nombre = " ".join(partes)
 
     # Si el nombre también venía en mayúsculas, separa por códigos conocidos
     if not nombre and codigos:
@@ -191,6 +217,17 @@ def parsear_evento(evento: dict, calendario: str = "") -> Servicio:
     )
 
     descripcion = (evento.get("description") or "").replace("<br>", "\n")
+    s.descripcion = descripcion
+    if re.search(r"fotos?", descripcion, re.I):
+        s.no_fotos = True
+    if re.search(r"paga(r[aá])?\s+(en\s+)?efectivo", descripcion, re.I):
+        s.paga_efectivo = True
+    m2 = re.search(r"(\d[\d.,\-– ]*)\s*(m2|m²|mts?|metros)\b", descripcion, re.I)
+    if m2:
+        s.metros = m2.group(1).strip(" -–")
+    bn = re.search(r"(\d+(?:[.,]5)?)\s*baños", descripcion, re.I)
+    if bn:
+        s.banos = bn.group(1)
     total_descuento = total_linea = None
     hay_por_cotizar = menciona_iva = False
     total_mas_iva = conceptos_mas_iva = False
@@ -230,6 +267,7 @@ def parsear_evento(evento: dict, calendario: str = "") -> Servicio:
 
         if ANTICIPO_RE.search(linea) and montos:
             s.anticipo += montos[0]
+            s.anticipo_metodo = metodo_de(linea) or s.anticipo_metodo
             continue
 
         desc = DESCUENTO_RE.search(linea)
@@ -298,6 +336,22 @@ def parsear_evento(evento: dict, calendario: str = "") -> Servicio:
     elif suma > 0:
         s.total, s.total_fuente = suma, "Suma de conceptos (estimado)"
 
+    # ------------------------------------------------ precio SIN IVA (base para cobrar)
+    if total_descuento is not None:
+        if s.iva is not None or total_mas_iva or menciona_iva:
+            s.base, s.base_fuente = round(total_descuento / (1 + TASA_IVA), 2), "Total con descuento ÷ 1.16"
+        else:
+            s.base, s.base_fuente = total_descuento, "Total con descuento"
+    elif total_linea is not None and total_mas_iva:
+        s.base, s.base_fuente = total_linea, "Total 'más IVA'"
+    elif s.subtotal is not None:
+        s.base, s.base_fuente = s.subtotal, "Subtotal"
+    elif total_linea is not None:
+        s.base, s.base_fuente = total_linea, "Total (sin aclarar IVA)"
+        s.alertas.append("El Total no dice si incluye IVA: se tomó como precio SIN IVA. Confírmalo.")
+    elif suma > 0:
+        s.base, s.base_fuente = round(suma, 2), "Suma de conceptos"
+
     # ------------------------------------------------ alertas de control
     if s.total is None:
         s.alertas.append("No encontré montos: no se puede calcular el saldo.")
@@ -315,6 +369,8 @@ def parsear_evento(evento: dict, calendario: str = "") -> Servicio:
         s.alertas.append("El IVA no es 16% del subtotal: revisa.")
     if hay_por_cotizar:
         s.alertas.append("Hay conceptos 'a cotizar': el total puede subir el día del servicio.")
+    if s.anticipo > 0 and not s.anticipo_metodo:
+        s.alertas.append("El anticipo no dice si fue efectivo o transferencia: se calculó como transferencia. Revísalo.")
     if s.anticipo == 0 and not s.liquidado_en_calendario:
         if s.anticipo_marcado:
             s.alertas.append("Tiene ✅ (anticipo dado) pero no dice el monto: agrega 'Anticipo $X' en la descripción.")

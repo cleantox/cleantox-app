@@ -35,3 +35,14 @@ def verificar(secreto: str, event_id: str, fecha: str, firma: str) -> tuple[bool
     if datetime.now(TZ).date() > dia:
         return False, "Este link ya venció. Pide uno nuevo a la oficina."
     return True, ""
+
+
+# ---------------- comprobante para el cliente (no vence)
+
+def crear_link_comprobante(app_url: str, secreto: str, event_id: str) -> str:
+    q = urlencode({"c": event_id, "k": _firma(secreto, "comprobante", event_id)})
+    return f"{app_url.rstrip('/')}/?{q}"
+
+
+def verificar_comprobante(secreto: str, event_id: str, firma: str) -> bool:
+    return bool(event_id and firma) and hmac.compare_digest(_firma(secreto, "comprobante", event_id), firma)
