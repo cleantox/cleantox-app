@@ -325,9 +325,14 @@ def vista_coordinadora(qp) -> None:
     ec = cuenta(s)
     if ec["pendiente"] is None:
         st.warning("La oficina no registró el monto de este servicio. Confirma con ellos cuánto cobrar.")
+    elif ec["nada_hoy"]:
+        st.info(f"🚚 Hoy solo se recoge el tapete. No cobres nada: se cobra el día de la entrega "
+                f"({pesos(s.cobro_en_entrega)} + IVA).")
     elif ec["liquidado"]:
         st.success("✅ Este servicio ya está pagado. No cobres nada.")
     else:
+        if s.cobro_en_entrega:
+            st.caption(f"El tapete ({pesos(s.cobro_en_entrega)} + IVA) NO se cobra hoy: se cobra en la entrega.")
         c1, c2 = st.columns(2)
         c1.metric("Si paga en efectivo", pesos(ec["efectivo"]))
         c2.metric("Si paga con transferencia o terminal", pesos(ec["transferencia"]))
@@ -648,7 +653,8 @@ def alertas_oficina(servicios: list, dia: date, usuario: str) -> None:
 def tarjeta(s, ec: dict, usuario: str) -> None:
     pendiente = ec["pendiente"]
     hora = hhmm(s.inicio)
-    estado = ("🟢 Liquidado" if ec["liquidado"] else "⚪ Sin monto" if pendiente is None
+    estado = ("🚚 Recolección: se cobra en la entrega" if ec["nada_hoy"] else
+              "🟢 Liquidado" if ec["liquidado"] else "⚪ Sin monto" if pendiente is None
               else f"🟠 Pendiente {pm(pendiente)} + IVA")
     horas = hb(s)
     cierre = cierre_de(s)
@@ -688,6 +694,8 @@ def tarjeta(s, ec: dict, usuario: str) -> None:
             if ec["extras"] or ec["extras_por_aprobar"]:
                 st.markdown(f"Extras aprobados: {pm(ec['extras'])}" +
                             (f" · por aprobar: {pm(ec['extras_por_aprobar'])}" if ec["extras_por_aprobar"] else ""))
+            if s.cobro_en_entrega:
+                st.markdown(f"🚚 Tapete por cobrar en la entrega: {pm(s.cobro_en_entrega)} + IVA")
             st.markdown(f"Anticipo: {pm(s.anticipo)} {md(s.anticipo_metodo or '(sin forma de pago)')}")
             for p in g.pagos_de_evento(tabla("Pagos"), s.event_id):
                 icono = "✔" if p.get("Estado") == g.CONFIRMADO else "⏳"

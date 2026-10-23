@@ -32,6 +32,9 @@ CODIGOS_SERVICIO = {
     "PRE": "Pre mudanza",
     "POST": "Post obra",
     "LIMPINT": "Limpieza integral",
+    "LIM": "Limpieza integral",
+    "ASP": "Aspirado profundo",
+    "ASPIRADO": "Aspirado profundo",
     "LIMPIN": "Limpieza integral",
     "LIMP": "Limpieza integral",
     "LIMPIEZA": "Limpieza integral",
@@ -43,6 +46,7 @@ CODIGOS_SERVICIO = {
     "RECOLECCION": "Recoger tapete",
     "RECOLECCIÓN": "Recoger tapete",
     "REC": "Recoger tapete",
+    "TAP": "Entrega de tapete",      # TAP solo = entrega (la venta se registra al entregar)
 }
 
 MONEY_RE = re.compile(r"\$\s?([\d,]+(?:\.\d{1,2})?)")
@@ -105,6 +109,7 @@ class Servicio:
     metros: str = ""
     banos: str = ""
     descripcion: str = ""
+    cobro_en_entrega: float = 0.0    # tapete recogido hoy: se vende y se cobra el día de la entrega
     liquidado_en_calendario: bool = False
     alertas: list[str] = field(default_factory=list)
     link_calendar: str = ""
@@ -174,7 +179,7 @@ def parsear_titulo(titulo: str) -> tuple[str, list[str], str]:
     m = re.match(r"^([^\wÁÉÍÓÚÑáéíóúñ]*)(.*)$", titulo)
     marca, resto = (m.group(1).strip(), m.group(2).strip()) if m else ("", titulo)
 
-    tokens = resto.split()
+    tokens = [re.sub(r"^[^\wÁÉÍÓÚÑ]+|[^\wÁÉÍÓÚÑ]+$", "", t) or t for t in resto.split()]
     codigos: list[str] = []
     i = 0
     while i < len(tokens) and tokens[i].isupper() and len(tokens[i]) > 1:
@@ -317,6 +322,11 @@ def parsear_evento(evento: dict, calendario: str = "") -> Servicio:
                                     cantidad=cantidad))
 
     suma = sum(c.importe for c in s.conceptos if c.importe is not None)
+    es_recoleccion = any(c in ("REC", "RECTAP", "RECOLECCION", "RECOLECCIÓN") for c in codigos)
+    tapete_rec = 0.0
+    if es_recoleccion:
+        tapete_rec = sum(c.importe for c in s.conceptos
+                         if c.importe is not None and re.search(r"tapete|alfombra", c.texto, re.I))
 
     # Prioridad del total: descuento > Total > Subtotal+IVA > Subtotal > suma
     if total_descuento is not None:
@@ -351,6 +361,12 @@ def parsear_evento(evento: dict, calendario: str = "") -> Servicio:
         s.alertas.append("El Total no dice si incluye IVA: se tomó como precio SIN IVA. Confírmalo.")
     elif suma > 0:
         s.base, s.base_fuente = round(suma, 2), "Suma de conceptos"
+
+    # Tapete recogido: no se vende hoy, se vende y cobra en la entrega
+    if tapete_rec and s.base is not None:
+        s.cobro_en_entrega = round(tapete_rec, 2)
+        s.base = round(max(s.base - tapete_rec, 0.0), 2)
+        s.base_fuente += " − tapete (se cobra en la entrega)"
 
     # ------------------------------------------------ alertas de control
     if s.total is None:
