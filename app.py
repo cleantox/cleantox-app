@@ -196,11 +196,29 @@ def carpeta_fotos(s, sub: str) -> str:
     return gg.carpeta(sub, gg.carpeta(nombre, raiz))
 
 
+def _norm(t: str) -> str:
+    import unicodedata
+    t = unicodedata.normalize("NFD", (t or "").lower())
+    return "".join(ch for ch in t if unicodedata.category(ch) != "Mn").strip()
+
+
 def tareas_de(s) -> list[str]:
+    """Tareas de la pestaña 'Tareas por servicio'. Acepta variantes como
+    'Desinfección y limpieza a vapor en baños': se incluyen si el evento menciona 'baño'."""
     cfgt = tareas_config()
+    desc = _norm(s.descripcion + " " + s.titulo_original)
     out = []
     for tipo in s.tipo_servicio.split(" · "):
-        out += cfgt.get(tipo.lower(), [])
+        base = _norm(tipo)
+        exactas, variantes = [], []
+        for clave, tareas in cfgt.items():
+            k = _norm(clave)
+            if k == base:
+                exactas += tareas
+            elif k.startswith(base + " en "):
+                variantes.append((k[len(base) + 4:], tareas))
+        elegidas = [t for (lugar, ts) in variantes if lugar[:4] and lugar[:4] in desc for t in ts]
+        out += exactas + (elegidas or [t for _, ts in variantes for t in ts])
     return out or [c.texto for c in s.conceptos]
 
 
