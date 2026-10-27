@@ -706,8 +706,6 @@ def vista_agenda(usuario: str) -> None:
     ahora = datetime.now(TZ)
     tardes = {s.event_id for s in negocio.retrasados([s for s in servicios if fecha_servicio(s) == hoy()], bit, ahora)}
 
-    avisos_oficina(usuario, tardes, servicios)
-
     titulo = (f"{lunes.day} {MESES[lunes.month - 1]} – {domingo.day} {MESES[domingo.month - 1]}"
               if lunes.month != domingo.month else f"{lunes.day} – {domingo.day} {MESES[lunes.month - 1]}")
     titulo += f" {domingo.year}"
@@ -743,6 +741,8 @@ def vista_agenda(usuario: str) -> None:
     elif nav == "hoy" and lunes != lunes_de(hoy()):
         ir(sem=None)
 
+    avisos_oficina(usuario, tardes, servicios)
+
     with st.expander(f"Totales de la semana · {n_trab} servicios"):
         a, b = st.columns(2)
         a.metric("Venta (sin IVA)", pesos(venta))
@@ -758,9 +758,11 @@ def avisos_oficina(usuario: str, tardes: set, servicios: list) -> None:
     bajas = [c for c in tabla("Cierres") if c.get("Fecha servicio", "") >= hace7
              and (c.get("Satisfacción") != CARAS[0] or c.get("Trato") != CARAS[0])]
 
-    for s in servicios:
-        if s.event_id in tardes:
-            st.error(md(f"⏰ {hhmm(s.inicio)} {s.cliente}: nadie ha registrado llegada."))
+    sin_llegada = [s for s in servicios if s.event_id in tardes]
+    if sin_llegada:
+        with st.expander(f"⏰ Sin llegada registrada hoy ({len(sin_llegada)})"):
+            for s in sin_llegada:
+                st.markdown(md(f"**{hhmm(s.inicio)}** {s.cliente}"))
 
     if pend:
         with st.expander(f"💵 Pagos por confirmar ({len(pend)}) · {pesos(g.sumar(pend))}"):
