@@ -190,8 +190,16 @@ def parsear_titulo(titulo: str) -> tuple[str, list[str], str]:
     tokens = [re.sub(r"^[^\wÁÉÍÓÚÑ]+|[^\wÁÉÍÓÚÑ]+$", "", t) or t for t in resto.split()]
     codigos: list[str] = []
     i = 0
-    while i < len(tokens) and tokens[i].isupper() and len(tokens[i]) > 1:
-        codigos.append(tokens[i])
+    es_cod = lambda t: t.isupper() and len(t) > 1
+    while i < len(tokens):
+        t = tokens[i]
+        # conectores entre códigos: "LIMPINT y LAV", "LAV + REC TAP"
+        if codigos and t.lower() in ("y", "+", "&", "/", "-") and i + 1 < len(tokens) and es_cod(tokens[i + 1]):
+            i += 1
+            continue
+        if not es_cod(t):
+            break
+        codigos.append(t)
         i += 1
     nombre = " ".join(tokens[i:])
     nombre = re.sub(r"\s*\d{1,2}(:\d{2})?\s*(a\.?\s?m\.?|p\.?\s?m\.?|hrs?)\.?", " ", nombre, flags=re.I)

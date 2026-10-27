@@ -20,6 +20,7 @@ import calculos
 import enlaces
 import google_api as g
 import negocio
+from agenda import agenda_semanal
 from firma import recuadro_firma
 from parser_servicios import es_servicio, parsear_evento
 
@@ -611,210 +612,325 @@ def puede_aprobar(usuario: str) -> bool:
     return MODO_LOCAL or usuario in APROBADORES
 
 
+DIAS = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
+MESES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"]
+
+
+@st.cache_data(ttl=120, show_spinner="Leyendo agenda…")
+def eventos_semana(lunes: date) -> list[dict]:
+    a = datetime.combine(lunes, datetime.min.time(), tzinfo=TZ)
+    return google().eventos(CALENDAR_ID, a, a + timedelta(days=7))
+
+
+def servicios_semana(lunes: date) -> list:
+    out = [parsear_evento(ev, "Servicios CleanTox") for ev in eventos_semana(lunes) if es_servicio(ev)]
+    return sorted(out, key=lambda s: s.inicio or datetime.max.replace(tzinfo=TZ))
+
+
+def lunes_de(d: date) -> date:
+    return d - timedelta(days=d.weekday())
+
+
+def ir(**cambios) -> None:
+    for k, v in cambios.items():
+        if v is None:
+            st.query_params.pop(k, None)
+        else:
+            st.query_params[k] = v
+    st.rerun()
+
+
+def corto(nombre: str) -> str:
+    p = nombre.split()
+    n = 2
+    while n < len(p) and p[n - 1].lower() in ("de", "del", "la", "las", "los", "y"):
+        n += 1
+    return " ".join(p[:n]) if p else nombre
+
+
+def estado_chip(s, ec: dict, retraso: bool, sabado: bool) -> tuple[str, str]:
+    if sabado:
+        return "reag", "🔁 por reagendar"
+    if retraso:
+        return "tarde", (pesos(ec["pendiente"]) if ec["pendiente"] else "sin llegada")
+    if ec["nada_hoy"]:
+        return "ent", "🚚 en entrega"
+    if ec["pendiente"] is None:
+        return "nada", "sin monto"
+    if ec["liquidado"]:
+        return "liq", "✅ liquidado"
+    return "pend", pesos(ec["pendiente"])
+
+
 def vista_oficina() -> None:
     usuario = usuario_oficina()
+    qp = st.query_params
 
     with st.sidebar:
+        st.image("logo.png", width=150)
         st.caption(usuario)
-        dia = st.date_input("Día", value=hoy(), format="DD/MM/YYYY")
-        mostrar_todo = st.toggle("Mostrar también eventos que no son servicios", value=False)
-        if st.button("🔄 Recargar"):
+        if st.button("📅 Agenda", width="stretch"):
+            ir(vista=None, ver=None)
+        if st.button("📞 Recompra", width="stretch"):
+            ir(vista="recompra", ver=None)
+        st.divider()
+        if st.button("🔄 Recargar datos", width="stretch"):
             st.cache_data.clear()
             st.rerun()
-        st.link_button("Abrir hoja de la app", f"https://docs.google.com/spreadsheets/d/{SHEET_ID}")
-        if st.button("📊 Actualizar reporte semanal"):
+        st.link_button("Abrir hoja de la app", f"https://docs.google.com/spreadsheets/d/{SHEET_ID}", width="stretch")
+        if st.button("📊 Actualizar reporte semanal", width="stretch"):
             with st.spinner("Armando reporte…"):
                 actualizar_reporte()
             st.success("Listo: pestaña 'Reporte semanal'.")
-        if not MODO_LOCAL and st.button("Cerrar sesión"):
+        if not MODO_LOCAL and st.button("Cerrar sesión", width="stretch"):
             st.logout()
 
-    servicios = [parsear_evento(ev, "Servicios CleanTox") for ev in eventos_dia(dia) if mostrar_todo or es_servicio(ev)]
-    servicios.sort(key=lambda s: s.inicio or datetime.max.replace(tzinfo=TZ))
-
-    st.image("logo.png", width=170)
-    alertas_oficina(servicios, dia, usuario)
-
-    st.title(f"Servicios del {dia.strftime('%d/%m/%Y')}")
-    cuentas = {s.event_id: cuenta(s) for s in servicios}
-    venta = sum(c["base"] or 0 for c in cuentas.values())
-    cobrado = sum(c["abonado"] for c in cuentas.values())
-    por_cobrar = sum(c["pendiente"] or 0 for c in cuentas.values())
-    sin_conf = g.sumar([p for s in servicios for p in g.pagos_de_evento(tabla("Pagos"), s.event_id)
-                        if p.get("Estado") == g.REPORTADO])
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Servicios", len(servicios))
-    c2.metric("Venta del día (sin IVA)", pesos(venta))
-    c3.metric("Por cobrar (sin IVA)", pesos(por_cobrar))
-    c4, c5, _ = st.columns(3)
-    c4.metric("Cobrado (sin IVA)", pesos(cobrado))
-    c5.metric("Pagos sin confirmar", pesos(sin_conf))
-
-    if not servicios:
-        st.info("No hay servicios este día en el calendario Servicios CleanTox.")
-    for s in servicios:
-        tarjeta(s, cuentas[s.event_id], usuario)
+    if qp.get("ver"):
+        ficha(qp["ver"], usuario)
+    elif qp.get("vista") == "recompra":
+        vista_recompra(usuario)
+    else:
+        vista_agenda(usuario)
 
 
-def alertas_oficina(servicios: list, dia: date, usuario: str) -> None:
+def vista_agenda(usuario: str) -> None:
+    try:
+        lunes = date.fromisoformat(st.query_params.get("sem", "")) if st.query_params.get("sem") else lunes_de(hoy())
+    except ValueError:
+        lunes = lunes_de(hoy())
+    lunes = lunes_de(lunes)
+    domingo = lunes + timedelta(days=6)
+
+    servicios = servicios_semana(lunes)
+    bit = tabla("Bitacora")
+    ahora = datetime.now(TZ)
+    tardes = {s.event_id for s in negocio.retrasados([s for s in servicios if fecha_servicio(s) == hoy()], bit, ahora)}
+
+    avisos_oficina(usuario, tardes, servicios)
+
+    titulo = (f"{lunes.day} {MESES[lunes.month - 1]} – {domingo.day} {MESES[domingo.month - 1]}"
+              if lunes.month != domingo.month else f"{lunes.day} – {domingo.day} {MESES[lunes.month - 1]}")
+    titulo += f" {domingo.year}"
+
+    dias, venta, por_cobrar, n_trab = [], 0.0, 0.0, 0
+    for i in range(7):
+        d = lunes + timedelta(days=i)
+        del_dia = [s for s in servicios if fecha_servicio(s) == d]
+        sabado = d.weekday() == 5
+        evs = []
+        for s in del_dia:
+            ec = cuenta(s)
+            clase, monto = estado_chip(s, ec, s.event_id in tardes, sabado)
+            horas = negocio.horas_bitacora(bit, s.event_id)
+            marcas = ("📍" if horas["llegada"] else "") + ("✍️" if cierre_de(s) else "")
+            evs.append({"id": s.event_id, "hora": hhmm(s.inicio), "cliente": corto(s.cliente),
+                        "tipo": s.tipo_servicio.split(" · ")[0], "monto": monto, "clase": clase, "marcas": marcas})
+            if not sabado:
+                venta += ec["base"] or 0
+                por_cobrar += ec["pendiente"] or 0
+                n_trab += 1
+        dias.append({"nombre": DIAS[i] + (" · reag." if sabado else ""), "num": d.day,
+                     "resumen": (f"{len(del_dia)} serv." if del_dia else ""), "hoy": d == hoy(),
+                     "sabado": sabado, "eventos": evs})
+
+    abierto, nav = agenda_semanal(dias, titulo, key=f"agenda_{lunes.isoformat()}")
+    if abierto:
+        ir(ver=abierto)
+    if nav == "prev":
+        ir(sem=(lunes - timedelta(days=7)).isoformat())
+    elif nav == "next":
+        ir(sem=(lunes + timedelta(days=7)).isoformat())
+    elif nav == "hoy" and lunes != lunes_de(hoy()):
+        ir(sem=None)
+
+    with st.expander(f"Totales de la semana · {n_trab} servicios"):
+        a, b = st.columns(2)
+        a.metric("Venta (sin IVA)", pesos(venta))
+        b.metric("Por cobrar (sin IVA)", pesos(por_cobrar))
+        st.caption("No incluye los servicios del sábado (reagendados).")
+
+
+def avisos_oficina(usuario: str, tardes: set, servicios: list) -> None:
     gg = google()
-    if dia == hoy():
-        for s in negocio.retrasados(servicios, tabla("Bitacora"), datetime.now(TZ)):
-            st.error(md(f"⏰ {s.cliente}: programado a las {hhmm(s.inicio)} y nadie ha registrado llegada."))
-
     pend = [p for p in tabla("Pagos") if p.get("Estado") == g.REPORTADO]
-    if pend:
-        with st.expander(f"💵 Pagos por confirmar: {pesos(g.sumar(pend))} ({len(pend)})", expanded=True):
-            for p in pend:
-                c1, c2, c3 = st.columns([5, 1, 1])
-                c1.markdown(md(f"**{pesos(p['Monto'])}** {p.get('Método', '')} · {p.get('Cliente', '')} · "
-                               f"{p.get('Registró', '')} · {p.get('Registrado', '')}"
-                               + (f" · _{p['Notas']}_" if p.get("Notas") else "")))
-                if c2.button("Confirmar", key=f"ok_{p['ID']}"):
-                    gg.cambiar_estado(SHEET_ID, p["_fila"], g.CONFIRMADO, usuario); refrescar(); st.rerun()
-                if c3.button("Rechazar", key=f"no_{p['ID']}"):
-                    gg.cambiar_estado(SHEET_ID, p["_fila"], g.RECHAZADO, usuario); refrescar(); st.rerun()
-
     por_aprobar = [e for e in tabla("Extras servicio") if e.get("Estado") == "Por aprobar"]
-    if por_aprobar:
-        with st.expander(f"⏳ Extras por aprobar ({len(por_aprobar)})", expanded=True):
-            for e in por_aprobar:
-                c1, c2, c3 = st.columns([5, 1, 1])
-                quitar = g.numero(e.get("Cantidad")) < 0
-                c1.markdown(md(f"{'➖ Quitar ' if quitar else ''}**{e.get('Concepto')}** × {abs(g.numero(e.get('Cantidad'))):g} = "
-                               f"{'−' if quitar else ''}{pesos(abs(g.numero(e.get('Importe sin IVA'))))} + IVA · {e.get('Cliente')} · "
-                               f"{e.get('Registró')}"))
-                if puede_aprobar(usuario):
-                    for col, est, k in ((c2, "Aprobado", "ap"), (c3, "Rechazado", "re")):
-                        if col.button("Aprobar" if k == "ap" else "Rechazar", key=f"{k}_{e['ID']}"):
-                            gg.actualizar(SHEET_ID, "Extras servicio", e["_fila"], {
-                                "Estado": est, "Aprobó": usuario,
-                                "Fecha aprobación": datetime.now(TZ).strftime("%Y-%m-%d %H:%M")})
-                            refrescar(); st.rerun()
-                else:
-                    c2.caption("Aprueban rrhh o administración")
-
     hace7 = (hoy() - timedelta(days=7)).isoformat()
     bajas = [c for c in tabla("Cierres") if c.get("Fecha servicio", "") >= hace7
              and (c.get("Satisfacción") != CARAS[0] or c.get("Trato") != CARAS[0])]
+
+    for s in servicios:
+        if s.event_id in tardes:
+            st.error(md(f"⏰ {hhmm(s.inicio)} {s.cliente}: nadie ha registrado llegada."))
+
+    if pend:
+        with st.expander(f"💵 Pagos por confirmar ({len(pend)}) · {pesos(g.sumar(pend))}"):
+            for p in pend:
+                st.markdown(md(f"**{pesos(p['Monto'])}** {p.get('Método', '')} · {p.get('Cliente', '')} · "
+                               f"{p.get('Registró', '')} · {p.get('Registrado', '')}"
+                               + (f" · _{p['Notas']}_" if p.get("Notas") else "")))
+                c1, c2 = st.columns(2)
+                if c1.button("Confirmar", key=f"ok_{p['ID']}", width="stretch"):
+                    gg.cambiar_estado(SHEET_ID, p["_fila"], g.CONFIRMADO, usuario); refrescar(); st.rerun()
+                if c2.button("Rechazar", key=f"no_{p['ID']}", width="stretch"):
+                    gg.cambiar_estado(SHEET_ID, p["_fila"], g.RECHAZADO, usuario); refrescar(); st.rerun()
+
+    if por_aprobar:
+        with st.expander(f"⏳ Extras por aprobar ({len(por_aprobar)})"):
+            for e in por_aprobar:
+                lista_aprobacion(e, usuario)
+
     if bajas:
-        with st.expander(f"⚠️ Calificaciones bajas en los últimos 7 días ({len(bajas)})"):
+        with st.expander(f"⚠️ Calificaciones bajas, 7 días ({len(bajas)})"):
             for c in bajas:
                 st.markdown(md(f"**{c.get('Cliente')}** {c.get('Fecha servicio')} · Satisfacción {c.get('Satisfacción')}"
                                f" · Trato {c.get('Trato')} · {c.get('Comentarios') or ''} · Tel {c.get('Teléfono')}"))
 
-    with st.expander("📞 Clientes para recontactar (recompra)"):
-        if st.button("Ver lista", key="ver_recompra") or st.session_state.get("ver_recompra_on"):
-            st.session_state["ver_recompra_on"] = True
-            lista = recontactar()
-            st.caption(f"{len(lista)} cliente(s) cumplieron su plazo sin nuevo servicio.")
-            for r in lista[:60]:
-                c1, c2, c3 = st.columns([4, 1, 1])
-                c1.markdown(md(f"**{r['cliente']}** · {r['tel']} · último: {r['ultimo']:%d/%m/%Y} ({r['tipo']})"))
-                primer = (r["cliente"].split() or [""])[0]
-                texto = (f"Hola {primer}, te saluda CleanTox 💚. Ya pasaron {r['meses']} meses desde tu último "
-                         f"servicio con nosotros. ¿Te gustaría agendar tu próxima limpieza? Con gusto te cotizamos.")
-                c2.link_button("WhatsApp", wa(r["tel"], texto))
-                if c3.button("Contactado", key=f"rc_{r['tel']}"):
-                    gg.agregar(SHEET_ID, "Recompra", {"Teléfono": r["tel"], "Cliente": r["cliente"],
-                                                      "Contactado": datetime.now(TZ).strftime("%Y-%m-%d"),
-                                                      "Por": usuario})
-                    recontactar.clear(); st.rerun()
+
+def lista_aprobacion(e: dict, usuario: str) -> None:
+    quitar = g.numero(e.get("Cantidad")) < 0
+    st.markdown(md(f"{'➖ Quitar ' if quitar else ''}**{e.get('Concepto')}** × {abs(g.numero(e.get('Cantidad'))):g} = "
+                   f"{'−' if quitar else ''}{pesos(abs(g.numero(e.get('Importe sin IVA'))))} + IVA · {e.get('Cliente')} · "
+                   f"{e.get('Registró')}"))
+    if puede_aprobar(usuario):
+        c1, c2 = st.columns(2)
+        for col, est, k in ((c1, "Aprobado", "ap"), (c2, "Rechazado", "re")):
+            if col.button("Aprobar" if k == "ap" else "Rechazar", key=f"{k}_{e['ID']}", width="stretch"):
+                google().actualizar(SHEET_ID, "Extras servicio", e["_fila"], {
+                    "Estado": est, "Aprobó": usuario, "Fecha aprobación": datetime.now(TZ).strftime("%Y-%m-%d %H:%M")})
+                refrescar(); st.rerun()
+    else:
+        st.caption("Aprueban rrhh o administración")
 
 
-def tarjeta(s, ec: dict, usuario: str) -> None:
-    pendiente = ec["pendiente"]
-    hora = hhmm(s.inicio)
-    estado = ("🚚 Recolección: se cobra en la entrega" if ec["nada_hoy"] else
-              "🟢 Liquidado" if ec["liquidado"] else "⚪ Sin monto" if pendiente is None
-              else f"🟠 Pendiente {pm(pendiente)} + IVA")
+def vista_recompra(usuario: str) -> None:
+    gg = google()
+    st.subheader("📞 Clientes para recontactar")
+    lista = recontactar()
+    st.caption(f"{len(lista)} cliente(s) cumplieron su plazo sin nuevo servicio. Los más antiguos primero.")
+    for r in lista[:80]:
+        with st.container(border=True):
+            st.markdown(md(f"**{r['cliente']}** · {r['tel']}  \núltimo: {r['ultimo']:%d/%m/%Y} ({r['tipo']})"))
+            primer = (r["cliente"].split() or [""])[0]
+            texto = (f"Hola {primer}, te saluda CleanTox 💚. Ya pasaron {r['meses']} meses desde tu último "
+                     f"servicio con nosotros. ¿Te gustaría agendar tu próxima limpieza? Con gusto te cotizamos.")
+            c1, c2 = st.columns(2)
+            c1.link_button("WhatsApp", wa(r["tel"], texto), width="stretch")
+            if c2.button("Contactado", key=f"rc_{r['tel']}", width="stretch"):
+                gg.agregar(SHEET_ID, "Recompra", {"Teléfono": r["tel"], "Cliente": r["cliente"],
+                                                  "Contactado": datetime.now(TZ).strftime("%Y-%m-%d"), "Por": usuario})
+                recontactar.clear(); st.rerun()
+
+
+def ficha(event_id: str, usuario: str) -> None:
+    if st.button("← Agenda"):
+        ir(ver=None)
+    ev = evento(event_id)
+    if not ev:
+        st.error("Este servicio ya no existe o fue cancelado.")
+        return
+    s = parsear_evento(ev, "Servicios CleanTox")
+    ec = cuenta(s)
     horas = hb(s)
     cierre = cierre_de(s)
+    pendiente = ec["pendiente"]
+    sabado = fecha_servicio(s).weekday() == 5
+    estado = ("🔁 Reagendado (sin fecha)" if sabado else "🚚 Recolección: se cobra en la entrega" if ec["nada_hoy"] else
+              "🟢 Liquidado" if ec["liquidado"] else "⚪ Sin monto" if pendiente is None
+              else f"🟠 Falta {pm(pendiente)} + IVA")
 
-    with st.container(border=True):
-        st.subheader(md(f"{hora} · {s.cliente}"))
-        bit = f"📍 {hhmm(horas['llegada'])} · 🏁 {hhmm(horas['salida'])}" + (
-            f" · {md(horas['coordinadora'])}" if horas["coordinadora"] else "")
-        st.caption(f"{md(s.tipo_servicio)}  ·  {estado}  ·  {bit}"
-                   + (f"  ·  ✍️ {cierre.get('Satisfacción')}" if cierre else "")
-                   + ("  ·  🚫 sin fotos" if s.no_fotos else ""))
-        izq, der = st.columns([3, 2])
+    st.subheader(md(s.cliente))
+    st.caption(md(f"{DIAS[fecha_servicio(s).weekday()]} {fecha_servicio(s):%d/%m} · {hhmm(s.inicio)}–{hhmm(s.fin)} · "
+                  f"{s.tipo_servicio}") + f"  \n{estado}" + ("  ·  🚫 sin fotos" if s.no_fotos else ""))
 
-        with izq:
-            st.markdown(f"📍 **Dirección:** {md(s.direccion) or '—'}")
-            st.markdown(f"📞 **Teléfono:** {s.telefono or '—'}" + (f"  ·  ✉️ {s.email}" if s.email else ""))
-            if s.conceptos:
-                st.dataframe(pd.DataFrame([{
-                    "Concepto": c.texto,
-                    "Cant.": str(c.cantidad) if c.monto_unitario is not None else "",
-                    "Precio": pesos(c.monto_unitario) if c.monto_unitario is not None else "",
-                    "Importe": pesos(c.importe) if c.importe is not None else "",
-                } for c in s.conceptos]), hide_index=True, width="stretch")
-            for a in s.alertas:
-                st.warning(md(a), icon="⚠️")
-            if cierre:
-                st.markdown(md(f"**Cierre:** firmó {cierre.get('Nombre de quien firma')} · Satisfacción "
-                               f"{cierre.get('Satisfacción')} · Trato {cierre.get('Trato')} · Agendar: "
-                               f"{cierre.get('Agendar de nuevo') or '—'}"))
-                if cierre.get("Tareas pendientes"):
-                    st.warning(md("Pendiente: " + cierre["Tareas pendientes"]))
-            if s.link_calendar:
-                st.markdown(f"[Abrir en Google Calendar]({s.link_calendar})")
+    t1, t2, t3, t4 = st.tabs(["Datos", "Cobro", "Coordinadora", "Cierre"])
 
-        with der:
-            st.markdown(f"**Precio sin IVA:** {pm(s.base)}  \n<small>{md(s.base_fuente)}</small>", unsafe_allow_html=True)
-            if ec["extras"] or ec["extras_por_aprobar"]:
-                st.markdown(f"Extras aprobados: {pm(ec['extras'])}" +
-                            (f" · por aprobar: {pm(ec['extras_por_aprobar'])}" if ec["extras_por_aprobar"] else ""))
-            if s.cobro_en_entrega:
-                st.markdown(f"🚚 Tapete por cobrar en la entrega: {pm(s.cobro_en_entrega)} + IVA")
-            st.markdown(f"Anticipo: {pm(s.anticipo)} {md(s.anticipo_metodo or '(sin forma de pago)')}")
-            for p in g.pagos_de_evento(tabla("Pagos"), s.event_id):
-                icono = "✔" if p.get("Estado") == g.CONFIRMADO else "⏳"
-                st.caption(md(f"{icono} {pesos(p['Monto'])} · {p.get('Método', '')} · {p.get('Estado', '')} · "
-                              f"{p.get('Registró', '')}"))
-            if pendiente:
-                st.markdown(f"### Falta: {pm(ec['efectivo'])} efectivo  \n"
-                            f"o {pm(ec['transferencia'])} transferencia")
-            elif ec["liquidado"]:
-                st.markdown("### ✅ Liquidado")
+    with t1:
+        if s.direccion:
+            st.markdown(f"📍 {md(s.direccion)}")
+            st.link_button("Abrir en Google Maps", "https://www.google.com/maps/search/?api=1&query="
+                           + urllib.parse.quote(s.direccion), width="stretch")
+        if s.telefono:
+            st.markdown(f"📞 {s.telefono}" + (f"  ·  ✉️ {s.email}" if s.email else ""))
+            c1, c2 = st.columns(2)
+            c1.link_button("Llamar", f"tel:+52{negocio.tel10(s.telefono)}", width="stretch")
+            c2.link_button("WhatsApp", wa(s.telefono, ""), width="stretch")
+        if s.origen:
+            st.caption(f"Origen: {md(s.origen)}")
+        if s.conceptos:
+            st.dataframe(pd.DataFrame([{
+                "Concepto": c.texto,
+                "Cant.": str(c.cantidad) if c.monto_unitario is not None else "",
+                "Importe": pesos(c.importe) if c.importe is not None else "",
+            } for c in s.conceptos]), hide_index=True, width="stretch")
+        for a in s.alertas:
+            st.warning(md(a), icon="⚠️")
+        if s.link_calendar:
+            st.link_button("Abrir en Google Calendar", s.link_calendar, width="stretch")
 
-            with st.expander("📲 Enviar a coordinadora"):
-                link = enlaces.crear_link(APP_URL, LINK_SECRET, s.event_id, fecha_servicio(s))
-                texto = (f"Servicio CleanTox {hora} – {s.cliente}. "
-                         f"Aquí ves la dirección, lo que se hace y cuánto cobrar: {link}")
-                st.link_button("Mandar por WhatsApp", wa("", texto), width="stretch")
-                st.caption("¿WhatsApp Web en otro navegador? Copia el mensaje con 📋 y pégalo en el chat:")
-                st.code(texto, language=None, wrap_lines=True)
+    with t2:
+        st.markdown(f"**Precio sin IVA:** {pm(s.base)}  \n<small>{md(s.base_fuente)}</small>", unsafe_allow_html=True)
+        if ec["extras"] or ec["extras_por_aprobar"]:
+            st.markdown(f"Extras aprobados: {pm(ec['extras'])}" +
+                        (f" · por aprobar: {pm(ec['extras_por_aprobar'])}" if ec["extras_por_aprobar"] else ""))
+        if s.cobro_en_entrega:
+            st.markdown(f"🚚 Tapete por cobrar en la entrega: {pm(s.cobro_en_entrega)} + IVA")
+        st.markdown(f"Anticipo: {pm(s.anticipo)} {md(s.anticipo_metodo or '(sin forma de pago)')}")
+        for p in g.pagos_de_evento(tabla("Pagos"), s.event_id):
+            icono = "✔" if p.get("Estado") == g.CONFIRMADO else "⏳"
+            st.caption(md(f"{icono} {pesos(p['Monto'])} · {p.get('Método', '')} · {p.get('Estado', '')} · "
+                          f"{p.get('Registró', '')}"))
+        if pendiente:
+            a, b = st.columns(2)
+            a.metric("Falta en efectivo", pesos(ec["efectivo"]))
+            b.metric("Falta con transferencia", pesos(ec["transferencia"]))
+            with st.expander("💵 Registrar pago recibido"):
+                metodo = st.radio("Método", METODOS, horizontal=True, key=f"m_{s.event_id}")
+                sugerido = ec["efectivo"] if metodo == "Efectivo" else ec["transferencia"]
+                with st.form(f"f_{s.event_id}", clear_on_submit=True):
+                    monto = st.number_input("Monto", min_value=0.0, value=float(sugerido), step=100.0)
+                    ref = st.text_input("Referencia / folio (opcional)")
+                    if st.form_submit_button("Registrar", width="stretch"):
+                        if monto <= 0:
+                            st.error("El monto debe ser mayor a cero.")
+                        else:
+                            google().agregar_pago(SHEET_ID, fecha_servicio=fecha_servicio(s).isoformat(),
+                                                  event_id=s.event_id, cliente=s.cliente, monto=monto, metodo=metodo,
+                                                  referencia=ref, registro=usuario, estado=g.CONFIRMADO)
+                            refrescar(); st.rerun()
+        elif ec["liquidado"]:
+            st.success("✅ Liquidado")
+        for e in [x for x in g.de_evento(tabla("Extras servicio"), s.event_id) if x.get("Estado") == "Por aprobar"]:
+            lista_aprobacion(e, usuario)
 
-            if cierre:
-                with st.expander("📄 Mandar comprobante al cliente"):
-                    link = enlaces.crear_link_comprobante(APP_URL, LINK_SECRET, s.event_id)
-                    primer = (s.cliente.split() or [""])[0]
-                    texto = (f"Hola {primer}, gracias por confiar en CleanTox 💚. Aquí está el comprobante de tu "
-                             f"servicio del {fecha_servicio(s):%d/%m/%Y}: {link}")
-                    if cierre.get("Satisfacción") == CARAS[0]:
-                        texto += (f"\n\n¿Nos ayudas con una reseña? {RESENAS_URL}\nComo agradecimiento tienes 10% de "
-                                  f"descuento en tu próximo servicio (aplican restricciones).")
-                    st.link_button("Mandar por WhatsApp", wa(s.telefono, texto), width="stretch")
-                    st.code(texto, language=None, wrap_lines=True)
+    with t3:
+        st.markdown(f"📍 Llegada: **{hhmm(horas['llegada'])}** · 🏁 Salida: **{hhmm(horas['salida'])}**"
+                    + (f"  \nCoordinadora: **{md(horas['coordinadora'])}**" if horas["coordinadora"] else ""))
+        link = enlaces.crear_link(APP_URL, LINK_SECRET, s.event_id, fecha_servicio(s))
+        texto = (f"Servicio CleanTox {hhmm(s.inicio)} – {s.cliente}. "
+                 f"Aquí ves la dirección, lo que se hace y cuánto cobrar: {link}")
+        st.link_button("📲 Mandar link por WhatsApp", wa("", texto), width="stretch")
+        st.caption("¿WhatsApp Web en otro navegador? Copia el mensaje con 📋:")
+        st.code(texto, language=None, wrap_lines=True)
 
-            if pendiente:
-                with st.expander("💵 Registrar pago recibido"):
-                    metodo = st.radio("Método", METODOS, horizontal=True, key=f"m_{s.event_id}")
-                    sugerido = ec["efectivo"] if metodo == "Efectivo" else ec["transferencia"]
-                    with st.form(f"f_{s.event_id}", clear_on_submit=True):
-                        monto = st.number_input("Monto", min_value=0.0, value=float(sugerido), step=100.0)
-                        ref = st.text_input("Referencia / folio (opcional)")
-                        if st.form_submit_button("Registrar"):
-                            if monto <= 0:
-                                st.error("El monto debe ser mayor a cero.")
-                            else:
-                                google().agregar_pago(SHEET_ID, fecha_servicio=fecha_servicio(s).isoformat(),
-                                                      event_id=s.event_id, cliente=s.cliente, monto=monto,
-                                                      metodo=metodo, referencia=ref, registro=usuario,
-                                                      estado=g.CONFIRMADO)
-                                refrescar(); st.rerun()
+    with t4:
+        if not cierre:
+            st.info("Todavía no hay cierre con el cliente.")
+        else:
+            st.markdown(md(f"Firmó **{cierre.get('Nombre de quien firma')}**  \nSatisfacción {cierre.get('Satisfacción')}"
+                           f" · Trato {cierre.get('Trato')} · Agendar: {cierre.get('Agendar de nuevo') or '—'}"))
+            if cierre.get("Comentarios"):
+                st.caption(md(cierre["Comentarios"]))
+            if cierre.get("Tareas pendientes"):
+                st.warning(md("Pendiente: " + cierre["Tareas pendientes"]))
+            link = enlaces.crear_link_comprobante(APP_URL, LINK_SECRET, s.event_id)
+            primer = (s.cliente.split() or [""])[0]
+            texto = (f"Hola {primer}, gracias por confiar en CleanTox 💚. Aquí está el comprobante de tu "
+                     f"servicio del {fecha_servicio(s):%d/%m/%Y}: {link}")
+            if cierre.get("Satisfacción") == CARAS[0]:
+                texto += (f"\n\n¿Nos ayudas con una reseña? {RESENAS_URL}\nComo agradecimiento tienes 10% de "
+                          f"descuento en tu próximo servicio (aplican restricciones).")
+            st.link_button("📄 Mandar comprobante por WhatsApp", wa(s.telefono, texto), width="stretch")
+            st.code(texto, language=None, wrap_lines=True)
 
 
 def actualizar_reporte() -> None:
