@@ -8,7 +8,9 @@ CleanTox · Servicios (versión web)
 
 from __future__ import annotations
 
+import io
 import re
+import threading
 import urllib.parse
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -92,27 +94,40 @@ def ahora_iso() -> str:
 
 # ------------------------------------------------------------------ Google (cacheado)
 
+_hilo = threading.local()
+_PESTANAS: dict = {}
+
+
 @st.cache_resource(show_spinner=False)
-def google() -> g.Google:
-    token = None
+def _token() -> dict | None:
     try:
-        token = dict(st.secrets["google_token"])
+        return dict(st.secrets["google_token"])
     except Exception:
-        pass
-    return g.Google(g.credenciales(token))
+        return None
 
 
-@st.cache_data(ttl=120, show_spinner="Leyendo calendario…")
+def google() -> g.Google:
+    """Una conexión por hilo: las librerías de Google no aguantan que varias
+    personas usen la misma conexión al mismo tiempo (eso tumbaba la app)."""
+    cli = getattr(_hilo, "google", None)
+    if cli is None:
+        cli = g.Google(g.credenciales(_token()))
+        cli._pestanas = _PESTANAS
+        _hilo.google = cli
+    return cli
+
+
+@st.cache_data(ttl=120, max_entries=10, show_spinner="Leyendo calendario…")
 def eventos_dia(dia: date) -> list[dict]:
     return google().eventos_del_dia(CALENDAR_ID, dia)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=60, max_entries=60, show_spinner=False)
 def evento(event_id: str) -> dict | None:
     return google().evento(CALENDAR_ID, event_id)
 
 
-@st.cache_data(ttl=20, show_spinner=False)
+@st.cache_data(ttl=20, max_entries=20, show_spinner=False)
 def tabla(nombre: str) -> list[dict]:
     if nombre == "Pagos":
         return google().leer_pagos(SHEET_ID)
@@ -148,7 +163,7 @@ def extras_lista() -> list[dict]:
     return out
 
 
-@st.cache_data(ttl=3600, show_spinner="Revisando historial de clientes…")
+@st.cache_data(ttl=3600, max_entries=1, show_spinner="Revisando historial de clientes…")
 def recontactar() -> list[dict]:
     gg = google()
     h = []
@@ -459,6 +474,21 @@ def ajustar_piezas(s, quien: str, hora: str) -> None:
                 st.rerun()
 
 
+def reducir_foto(f) -> tuple[bytes, str, str]:
+    """Baja la foto a máx. 2000 px (sigue viéndose bien para redes) para no llenar la memoria."""
+    ext = f.name.rsplit(".", 1)[-1].lower() if "." in f.name else "jpg"
+    try:
+        from PIL import Image, ImageOps
+        img = ImageOps.exif_transpose(Image.open(f))
+        img.thumbnail((2000, 2000))
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, "JPEG", quality=85, optimize=True)
+        img.close()
+        return buf.getvalue(), "jpg", "image/jpeg"
+    except Exception:
+        return f.getvalue(), ext, f.type or "image/jpeg"
+
+
 def fotos(s, sub: str, titulo: str) -> None:
     st.subheader(titulo)
     archivos = st.file_uploader(f"Toma o elige fotos ({sub.lower()})", type=["jpg", "jpeg", "png", "heic", "webp"],
@@ -469,9 +499,9 @@ def fotos(s, sub: str, titulo: str) -> None:
             carpeta = carpeta_fotos(s, sub)
             n = gg.contar_archivos(carpeta)
             for i, f in enumerate(archivos, start=1):
-                ext = f.name.rsplit(".", 1)[-1].lower() if "." in f.name else "jpg"
-                gg.subir(carpeta, f"{s.cliente} - {sub.lower()} - {n + i:02d}.{ext}", f.getvalue(),
-                         f.type or "image/jpeg")
+                datos, ext, mime = reducir_foto(f)
+                gg.subir(carpeta, f"{s.cliente} - {sub.lower()} - {n + i:02d}.{ext}", datos, mime)
+                del datos
         st.session_state["aviso"] = f"{len(archivos)} foto(s) de {sub.lower()} guardadas."
         st.session_state.pop(f"fotos_{sub}", None)
         st.rerun()
@@ -616,7 +646,7 @@ DIAS = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
 MESES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"]
 
 
-@st.cache_data(ttl=120, show_spinner="Leyendo agenda…")
+@st.cache_data(ttl=120, max_entries=8, show_spinner="Leyendo agenda…")
 def eventos_semana(lunes: date) -> list[dict]:
     a = datetime.combine(lunes, datetime.min.time(), tzinfo=TZ)
     return google().eventos(CALENDAR_ID, a, a + timedelta(days=7))
