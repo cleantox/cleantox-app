@@ -829,6 +829,15 @@ def vista_oficina() -> None:
         if not MODO_LOCAL and st.button("Cerrar sesión", width="stretch"):
             st.logout()
 
+    # Navegación visible arriba (en el celular el menú lateral casi no se ve)
+    if not qp.get("ver"):
+        pantallas = {"📅 Agenda": None, "🚐 Plan de mañana": "plan", "📞 Recompra": "recompra"}
+        actual = next((k for k, v in pantallas.items() if v == qp.get("vista")), "📅 Agenda")
+        elegida = st.segmented_control("Pantalla", list(pantallas), default=actual, key=f"nav_{actual}",
+                                       label_visibility="collapsed", width="stretch")
+        if elegida and elegida != actual:
+            ir(vista=pantallas[elegida], ver=None)
+
     if qp.get("ver"):
         ficha(qp["ver"], usuario)
     elif qp.get("vista") == "recompra":
