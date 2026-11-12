@@ -32,9 +32,10 @@ SCOPES = [
 # ------------------------------------------------------------------ pestañas de la hoja
 HOJA_PAGOS = "Pagos"
 TABLAS = {
-    "Pagos": ["ID", "Registrado", "Fecha servicio", "Event ID", "Cliente", "Monto", "Método",
-              "Referencia", "Registró", "Estado", "Confirmó", "Fecha confirmación", "Notas",
-              "Abono sin IVA", "IVA a declarar"],
+    "Pagos": ["Fecha servicio", "Cliente", "Monto anticipo", "Monto liquidación", "Método de pago", "Registrado",
+              "Estado", "Confirmó", "Fecha confirmación", "Notas",
+              # columnas que usa la app (van ocultas al final)
+              "ID", "Event ID", "Fecha registro", "Referencia", "Abono sin IVA", "IVA a declarar"],
     "Bitacora": ["ID", "Registrado", "Event ID", "Fecha servicio", "Cliente", "Evento", "Hora",
                  "Coordinadora", "Hora programada"],
     "Extras servicio": ["ID", "Registrado", "Event ID", "Fecha servicio", "Cliente", "Concepto", "Cantidad",
@@ -46,6 +47,7 @@ TABLAS = {
                 "Nombre de quien firma", "Firma (archivo)", "Total sin IVA", "Pendiente sin IVA"],
     "Recompra": ["Teléfono", "Cliente", "Contactado", "Por", "Notas"],
     "Alertas enviadas": ["Event ID", "Tipo", "Fecha"],
+    "Borradores cierre": ["Event ID", "Datos", "Actualizado"],
     "Asignaciones": ["Fecha servicio", "Event ID", "Cliente", "Servicio", "Personal", "Coordinadora",
                      "Camioneta", "Chofer", "Registró", "Registrado"],
 }
@@ -163,6 +165,8 @@ class Google:
             datos["ID"] = uuid.uuid4().hex[:8].upper()
         if "Registrado" in enc and not datos.get("Registrado"):
             datos["Registrado"] = ahora().strftime("%Y-%m-%d %H:%M")
+        if "Fecha registro" in enc and not datos.get("Fecha registro"):
+            datos["Fecha registro"] = ahora().strftime("%Y-%m-%d %H:%M")
         fila = [datos.get(c, "") for c in enc]
         self.sheets.spreadsheets().values().append(
             spreadsheetId=sheet_id, range=f"'{tabla}'!A1", valueInputOption="RAW",
@@ -193,23 +197,34 @@ class Google:
     # -------------------------------------------------------------- pagos (atajos)
 
     def leer_pagos(self, sheet_id: str) -> list[dict]:
+        """Devuelve los pagos con nombres internos fijos (Monto, Método, Registró, Registrado)
+        aunque la hoja use 'Monto liquidación', 'Método de pago', etc."""
         pagos = self.leer_tabla(sheet_id, HOJA_PAGOS)
         for p in pagos:
-            p["Monto"] = _num(p.get("Monto"))
+            nuevo = "Monto liquidación" in p
+            p["Monto"] = _num(p.get("Monto liquidación") if nuevo else p.get("Monto"))
+            p["Monto anticipo"] = _num(p.get("Monto anticipo"))
+            if nuevo:
+                p["Método"] = p.get("Método de pago", "")
+                p["Registró"] = p.get("Registrado", "")
+                p["Registrado"] = p.get("Fecha registro", "")
         return pagos
 
     def agregar_pago(self, sheet_id: str, *, fecha_servicio: str, event_id: str, cliente: str,
                      monto: float, metodo: str, referencia: str, registro: str, estado: str,
-                     notas: str = "") -> str:
+                     notas: str = "", anticipo: float = 0.0) -> str:
+        """Un renglón por pago recibido. 'anticipo' (del calendario) solo se pone en el primer pago del servicio."""
         from calculos import abono, iva_a_declarar
         confirmado = estado == CONFIRMADO
         return self.agregar(sheet_id, HOJA_PAGOS, {
-            "Fecha servicio": fecha_servicio, "Event ID": event_id, "Cliente": cliente,
-            "Monto": round(float(monto), 2), "Método": metodo, "Referencia": referencia,
-            "Registró": registro, "Estado": estado,
+            "Fecha servicio": fecha_servicio, "Cliente": cliente,
+            "Monto anticipo": round(float(anticipo), 2) if anticipo else "",
+            "Monto liquidación": round(float(monto), 2), "Método de pago": metodo,
+            "Registrado": registro, "Estado": estado,
             "Confirmó": registro if confirmado else "",
             "Fecha confirmación": ahora().strftime("%Y-%m-%d %H:%M") if confirmado else "",
-            "Notas": notas, "Abono sin IVA": abono(monto, metodo), "IVA a declarar": iva_a_declarar(monto),
+            "Notas": notas, "Event ID": event_id, "Referencia": referencia,
+            "Abono sin IVA": abono(monto, metodo), "IVA a declarar": iva_a_declarar(monto),
         })
 
     def cambiar_estado(self, sheet_id: str, fila: int, estado: str, quien: str) -> None:
@@ -241,6 +256,14 @@ class Google:
         if padre:
             cuerpo["parents"] = [padre]
         return self.drive.files().create(body=cuerpo, fields="id").execute()["id"]
+
+    def buscar_carpeta(self, nombre: str, padre: str | None = None) -> str | None:
+        """Como carpeta() pero sin crearla si no existe."""
+        q = f"name = '{nombre.replace(chr(39), ' ')}' and mimeType = '{CARPETA}' and trashed = false"
+        if padre:
+            q += f" and '{padre}' in parents"
+        r = self.drive.files().list(q=q, fields="files(id)", spaces="drive").execute().get("files", [])
+        return r[0]["id"] if r else None
 
     def contar_archivos(self, carpeta_id: str) -> int:
         r = self.drive.files().list(q=f"'{carpeta_id}' in parents and trashed = false",

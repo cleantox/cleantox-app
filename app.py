@@ -9,6 +9,7 @@ CleanTox · Servicios (versión web)
 from __future__ import annotations
 
 import io
+import json
 import re
 import threading
 import urllib.parse
@@ -192,6 +193,25 @@ def cuenta(s) -> dict:
                                   g.de_evento(tabla("Extras servicio"), s.event_id))
 
 
+def anticipo_para_pago(s) -> float:
+    """El anticipo del calendario se anota solo en el primer pago del servicio (para no sumarlo doble)."""
+    ya = [p for p in tabla("Pagos") if p.get("Event ID") == s.event_id]
+    return 0.0 if ya else float(s.anticipo or 0)
+
+
+def pago_repetido(s, monto: float, metodo: str) -> bool:
+    """¿Ya hay un pago igual (mismo servicio, monto y método) registrado en los últimos 15 minutos?"""
+    limite = datetime.now(TZ) - timedelta(minutes=15)
+    for p in g.pagos_de_evento(tabla("Pagos"), s.event_id):
+        try:
+            cuando = datetime.strptime(str(p.get("Registrado", ""))[:16], "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+        except ValueError:
+            continue
+        if abs(float(p["Monto"]) - float(monto)) < 0.01 and p.get("Método") == metodo and cuando >= limite:
+            return True
+    return False
+
+
 def cierre_de(s) -> dict | None:
     c = g.de_evento(tabla("Cierres"), s.event_id)
     return c[0] if c else None
@@ -208,8 +228,55 @@ def hhmm(d) -> str:
 def carpeta_fotos(s, sub: str) -> str:
     gg = google()
     raiz = FOTOS_FOLDER_ID or gg.carpeta("FOTOS SERVICIOS")
-    nombre = f"{fecha_servicio(s).isoformat()} · {s.cliente} · {s.tipo_servicio.split(' · ')[0]}"
-    return gg.carpeta(sub, gg.carpeta(nombre, raiz))
+    return gg.carpeta(sub, gg.carpeta(_nombre_carpeta(s), raiz))
+
+
+def _nombre_carpeta(s) -> str:
+    return f"{fecha_servicio(s).isoformat()} · {s.cliente} · {s.tipo_servicio.split(' · ')[0]}"
+
+
+@st.cache_data(ttl=120, max_entries=100, show_spinner=False)
+def fotos_guardadas(event_id: str, nombre_carpeta: str, sub: str) -> int:
+    """Cuántas fotos ya hay en Drive para este servicio (sin crear carpetas)."""
+    gg = google()
+    raiz = FOTOS_FOLDER_ID or gg.buscar_carpeta("FOTOS SERVICIOS")
+    if not raiz:
+        return 0
+    serv = gg.buscar_carpeta(nombre_carpeta, raiz)
+    sub_id = gg.buscar_carpeta(sub, serv) if serv else None
+    return gg.contar_archivos(sub_id) if sub_id else 0
+
+
+def coordinadora_de(s) -> str:
+    """Quién es la coordinadora: la que marcó llegada o la que puso Ian en el plan."""
+    h = hb(s)
+    if h.get("coordinadora"):
+        return h["coordinadora"]
+    a = g.de_evento(tabla("Asignaciones"), s.event_id)
+    return a[0].get("Coordinadora", "") if a else ""
+
+
+CAMPOS_CIERRE = ["pendientes", "metros", "banos", "amueblado", "cristales", "otros", "operadores",
+                 "satis", "trato", "agendar", "comentarios", "nombre_firma"]
+
+
+def guardar_borrador(event_id: str) -> None:
+    """Se llama cada vez que la coordinadora cambia algo del cierre: queda guardado en la hoja."""
+    datos = {k: st.session_state.get(k) for k in CAMPOS_CIERRE}
+    datos.update({k: v for k, v in st.session_state.items() if str(k).startswith("tarea_")})
+    texto = json.dumps(datos, ensure_ascii=False, default=str)
+    try:
+        gg = google()
+        previo = g.de_evento(tabla("Borradores cierre"), event_id)
+        if previo:
+            gg.actualizar(SHEET_ID, "Borradores cierre", previo[0]["_fila"],
+                          {"Datos": texto, "Actualizado": ahora_iso()})
+        else:
+            gg.agregar(SHEET_ID, "Borradores cierre", {"Event ID": event_id, "Datos": texto,
+                                                       "Actualizado": ahora_iso()})
+        refrescar()
+    except Exception:
+        pass
 
 
 def _norm(t: str) -> str:
@@ -277,6 +344,10 @@ def vista_coordinadora(qp) -> None:
     # ---------------- quién eres
     st.subheader("1 · ¿Quién eres?")
     nombres = personal()
+    if "quien" not in st.session_state:
+        previa = coordinadora_de(s)
+        if previa and (previa in nombres or not nombres):
+            st.session_state["quien"] = previa
     if nombres:
         quien = st.selectbox("Tu nombre", nombres, index=None, placeholder="Elige tu nombre", key="quien")
     else:
@@ -362,6 +433,11 @@ def vista_coordinadora(qp) -> None:
     # ---------------- cobro
     st.subheader("7 · Cobro")
     ec = cuenta(s)
+    ya_pagos = g.pagos_de_evento(tabla("Pagos"), s.event_id)
+    for p in ya_pagos:
+        icono = {g.CONFIRMADO: "✅", g.RECHAZADO: "✖"}.get(p.get("Estado"), "⏳")
+        st.caption(md(f"{icono} Ya registrado: {pesos(g.numero(p.get('Monto')))} · {p.get('Método')} · "
+                      f"{p.get('Estado')} · folio {p.get('ID')}"))
     if ec["pendiente"] is None:
         st.warning("La oficina no registró el monto de este servicio. Confirma con ellos cuánto cobrar.")
     elif ec["nada_hoy"]:
@@ -390,10 +466,14 @@ def vista_coordinadora(qp) -> None:
         if enviar:
             if monto <= 0 or not seguro:
                 st.error("Pon el monto y marca la casilla para confirmar.")
+            elif pago_repetido(s, monto, metodo):
+                st.error("Este pago ya quedó registrado hace unos minutos (mismo monto y forma de pago). "
+                         "No lo registres otra vez; si de verdad es otro pago, avisa a la oficina.")
             else:
                 pid = gg.agregar_pago(SHEET_ID, fecha_servicio=fecha_servicio(s).isoformat(), event_id=s.event_id,
                                       cliente=s.cliente, monto=monto, metodo=metodo, referencia="",
-                                      registro=quien, estado=g.REPORTADO, notas=notas.strip())
+                                      registro=quien, estado=g.REPORTADO, notas=notas.strip(),
+                                      anticipo=anticipo_para_pago(s))
                 restante = calculos.cobrar(max(ec["pendiente"] - calculos.abono(monto, metodo), 0), metodo)
                 try:
                     gg.enviar_correo(NOTIFICAR_A, f"💵 {metodo} reportado {pesos(monto)} – {s.cliente}",
@@ -491,47 +571,79 @@ def reducir_foto(f) -> tuple[bytes, str, str]:
 
 def fotos(s, sub: str, titulo: str) -> None:
     st.subheader(titulo)
-    archivos = st.file_uploader(f"Toma o elige fotos ({sub.lower()})", type=["jpg", "jpeg", "png", "heic", "webp"],
-                                accept_multiple_files=True, key=f"fotos_{sub}")
-    if archivos and st.button(f"Subir {len(archivos)} foto(s) de {sub.lower()}", key=f"subir_{sub}", width="stretch"):
+    try:
+        ya = fotos_guardadas(s.event_id, _nombre_carpeta(s), sub)
+    except Exception:
+        ya = 0
+    if ya:
+        st.success(f"✅ {ya} foto(s) de {sub.lower()} ya guardadas. Puedes agregar más.")
+    kver = f"fotos_ver_{sub}"
+    archivos = st.file_uploader(f"Toma o elige fotos ({sub.lower()}) · se guardan solas",
+                                type=["jpg", "jpeg", "png", "heic", "webp"],
+                                accept_multiple_files=True, key=f"fotos_{sub}_{st.session_state.get(kver, 0)}")
+    if archivos:
         gg = google()
-        with st.spinner("Subiendo fotos…"):
+        with st.spinner(f"Guardando {len(archivos)} foto(s)…"):
             carpeta = carpeta_fotos(s, sub)
             n = gg.contar_archivos(carpeta)
             for i, f in enumerate(archivos, start=1):
                 datos, ext, mime = reducir_foto(f)
                 gg.subir(carpeta, f"{s.cliente} - {sub.lower()} - {n + i:02d}.{ext}", datos, mime)
                 del datos
+        fotos_guardadas.clear()
+        st.session_state[kver] = st.session_state.get(kver, 0) + 1   # vacía el selector
         st.session_state["aviso"] = f"{len(archivos)} foto(s) de {sub.lower()} guardadas."
-        st.session_state.pop(f"fotos_{sub}", None)
         st.rerun()
 
 
 def formulario_cierre(s, quien: str, ec: dict) -> None:
     gg = google()
-    st.markdown("**Parte de la coordinadora**")
     tareas = tareas_de(s)
-    hechas = [t for i, t in enumerate(tareas) if st.checkbox(t, value=True, key=f"tarea_{i}")]
-    pendientes = st.text_area("¿Quedó algo pendiente?", key="pendientes")
+    # Recupera lo que ya había llenado (si salió del link y volvió a entrar)
+    if not st.session_state.get("_borrador_cargado"):
+        b = g.de_evento(tabla("Borradores cierre"), s.event_id)
+        datos = {}
+        if b:
+            try:
+                datos = json.loads(b[0].get("Datos") or "{}")
+            except ValueError:
+                datos = {}
+        defaults = {"metros": s.metros, "banos": s.banos,
+                    "operadores": [quien] if quien in personal() else []}
+        for k in CAMPOS_CIERRE:
+            v = datos.get(k, defaults.get(k))
+            if k == "operadores":
+                v = [x for x in (v or []) if x in personal()]
+            if v is not None:
+                st.session_state[k] = v
+        for i, _ in enumerate(tareas):
+            st.session_state[f"tarea_{i}"] = bool(datos.get(f"tarea_{i}", True))
+        st.session_state["_borrador_cargado"] = True
+        if datos:
+            st.info("Recuperamos lo que ya habías llenado del cierre.")
+    guarda = {"on_change": guardar_borrador, "args": (s.event_id,)}
+
+    st.markdown("**Parte de la coordinadora**")
+    hechas = [t for i, t in enumerate(tareas) if st.checkbox(t, key=f"tarea_{i}", **guarda)]
+    pendientes = st.text_area("¿Quedó algo pendiente?", key="pendientes", **guarda)
     c1, c2 = st.columns(2)
-    metros = c1.text_input("Metros cuadrados", value=s.metros, key="metros")
-    banos = c2.text_input("Baños", value=s.banos, key="banos")
-    amueblado = c1.radio("Amueblado", ["Sí", "No"], horizontal=True, index=None, key="amueblado")
-    cristales = c2.text_input("Cristales", key="cristales")
-    otros = st.text_input("Otros", key="otros")
-    operadores = st.multiselect("Operadores que fueron", personal(), default=[quien] if quien in personal() else [],
-                                key="operadores")
+    metros = c1.text_input("Metros cuadrados", key="metros", **guarda)
+    banos = c2.text_input("Baños", key="banos", **guarda)
+    amueblado = c1.radio("Amueblado", ["Sí", "No"], horizontal=True, index=None, key="amueblado", **guarda)
+    cristales = c2.text_input("Cristales", key="cristales", **guarda)
+    otros = st.text_input("Otros", key="otros", **guarda)
+    operadores = st.multiselect("Operadores que fueron", personal(), key="operadores", **guarda)
 
     st.divider()
     st.markdown("**Parte del cliente** — pásale el celular al cliente")
     st.markdown(f"Servicio: **{md(s.tipo_servicio)}**  \nTotal del servicio: **{pm(ec['base'])} + IVA**  \n"
                 f"Pendiente: **{pm(ec['efectivo'])}** en efectivo o **{pm(ec['transferencia'])}** con transferencia")
-    satis = st.radio("¿Qué tan satisfecho quedas?", CARAS, horizontal=True, index=None, key="satis")
-    trato = st.radio("El trato del operador fue:", CARAS, horizontal=True, index=None, key="trato")
+    satis = st.radio("¿Qué tan satisfecho quedas?", CARAS, horizontal=True, index=None, key="satis", **guarda)
+    trato = st.radio("El trato del operador fue:", CARAS, horizontal=True, index=None, key="trato", **guarda)
     agendar = st.radio("¿Te gustaría agendar de nuevo en…?", list(negocio.INTERVALOS), horizontal=True,
-                       index=None, key="agendar")
-    comentarios = st.text_area("Comentarios", key="comentarios")
-    nombre = st.text_input("Tu nombre", key="nombre_firma")
+                       index=None, key="agendar", **guarda)
+    comentarios = st.text_area("Comentarios", key="comentarios", **guarda)
+    nombre = st.text_input("Tu nombre", key="nombre_firma", **guarda)
     st.caption(TEXTO_LEGAL)
     st.markdown(f"[Aviso de privacidad]({PRIVACIDAD_URL}) · [Términos y condiciones]({TERMINOS_URL})")
     st.markdown("**Firma aquí con el dedo** y luego toca *Usar esta firma*")
@@ -1109,10 +1221,13 @@ def ficha(event_id: str, usuario: str) -> None:
                     if st.form_submit_button("Registrar", width="stretch"):
                         if monto <= 0:
                             st.error("El monto debe ser mayor a cero.")
+                        elif pago_repetido(s, monto, metodo):
+                            st.error("Ya hay un pago igual registrado hace unos minutos.")
                         else:
                             google().agregar_pago(SHEET_ID, fecha_servicio=fecha_servicio(s).isoformat(),
                                                   event_id=s.event_id, cliente=s.cliente, monto=monto, metodo=metodo,
-                                                  referencia=ref, registro=usuario, estado=g.CONFIRMADO)
+                                                  referencia=ref, registro=usuario, estado=g.CONFIRMADO,
+                                                  anticipo=anticipo_para_pago(s))
                             refrescar(); st.rerun()
         elif ec["liquidado"]:
             st.success("✅ Liquidado")
