@@ -46,6 +46,8 @@ TABLAS = {
                 "Nombre de quien firma", "Firma (archivo)", "Total sin IVA", "Pendiente sin IVA"],
     "Recompra": ["Teléfono", "Cliente", "Contactado", "Por", "Notas"],
     "Alertas enviadas": ["Event ID", "Tipo", "Fecha"],
+    "Asignaciones": ["Fecha servicio", "Event ID", "Cliente", "Servicio", "Personal", "Coordinadora",
+                     "Camioneta", "Chofer", "Registró", "Registrado"],
 }
 REPORTADO = "Reportado por coordinadora"
 CONFIRMADO = "Confirmado"

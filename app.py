@@ -701,6 +701,8 @@ def vista_oficina() -> None:
         st.caption(usuario)
         if st.button("📅 Agenda", width="stretch"):
             ir(vista=None, ver=None)
+        if st.button("🚐 Plan de mañana", width="stretch"):
+            ir(vista="plan", ver=None)
         if st.button("📞 Recompra", width="stretch"):
             ir(vista="recompra", ver=None)
         st.divider()
@@ -719,8 +721,191 @@ def vista_oficina() -> None:
         ficha(qp["ver"], usuario)
     elif qp.get("vista") == "recompra":
         vista_recompra(usuario)
+    elif qp.get("vista") == "plan":
+        vista_plan(usuario)
     else:
         vista_agenda(usuario)
+
+
+# ------------------------------------------------------------------ plan de mañana (Ian)
+
+CAMIONETAS = ["Avanza", "Hyundai 1", "Hyundai 2"]
+
+
+def siguiente_dia_laboral(d: date) -> date:
+    d += timedelta(days=1)
+    while d.weekday() == 5:          # sábado no se trabaja
+        d += timedelta(days=1)
+    return d
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def choferes() -> list[str]:
+    filas = google().leer_tabla(SHEET_ID, "Personal")
+    ch = sorted({f.get("Nombre", "").strip() for f in filas
+                 if "chofer" in str(f.get("Puesto", "")).lower() and f.get("Nombre", "").strip()
+                 and str(f.get("Activo (SI/NO)", "SI")).strip().upper() != "NO"})
+    return ch or personal()
+
+
+def etiqueta(s) -> str:
+    """'LAV y REC Luz María Arce' / 'PRE Edith Zariñana 140m²' como lo escribe Ian."""
+    t = re.sub(r"^[^\wÁÉÍÓÚÑáéíóúñ]+", "", s.titulo_original or "").replace("\n", " ")
+    t = re.sub(r"[✅️⭐]", "", t)
+    primera = (s.cliente.split() or [""])[0]
+    i = t.find(primera) if primera else -1
+    codigo = re.sub(r"[\s,;/\-]+$", "", t[:i]).strip() if i > 0 else " ".join(s.codigos)
+    metros = ""
+    if s.metros and not codigo.upper().startswith(("LAV", "ENT", "REC", "TAP")):
+        metros = f" {s.metros.replace(' ', '')}m²"
+    return f"{codigo} {s.cliente}{metros}".strip()
+
+
+def maps_lugar(direccion: str) -> str:
+    return "https://www.google.com/maps/search/?api=1&query=" + urllib.parse.quote(direccion)
+
+
+def maps_ruta(direcciones: list[str]) -> str:
+    dirs = [d for d in direcciones if d][:10]
+    if not dirs:
+        return ""
+    q = {"api": "1", "travelmode": "driving", "destination": dirs[-1]}
+    if len(dirs) > 1:
+        q["waypoints"] = "|".join(dirs[:-1])
+    return "https://www.google.com/maps/dir/?" + urllib.parse.urlencode(q)
+
+
+def bloque_copiar(titulo: str, texto: str, key: str) -> None:
+    st.markdown(f"**{titulo}**")
+    st.code(texto, language=None, wrap_lines=True)
+    st.link_button("Abrir en WhatsApp", "https://wa.me/?text=" + urllib.parse.quote(texto), width="stretch")
+
+
+def vista_plan(usuario: str) -> None:
+    try:
+        por_defecto = date.fromisoformat(st.query_params.get("dia", "")) if st.query_params.get("dia") \
+            else siguiente_dia_laboral(hoy())
+    except ValueError:
+        por_defecto = siguiente_dia_laboral(hoy())
+    st.subheader("🚐 Plan de mañana")
+    dia = st.date_input("Día", value=por_defecto, format="DD/MM/YYYY")
+    if dia.weekday() == 5:
+        st.info("Es sábado: no se trabaja. Los servicios de sábado son reagendados.")
+    servicios = [parsear_evento(ev, "Servicios CleanTox") for ev in eventos_dia(dia) if es_servicio(ev)]
+    servicios = [s for s in servicios if "PAG" not in s.codigos]
+    servicios.sort(key=lambda s: s.inicio or datetime.max.replace(tzinfo=TZ))
+    if not servicios:
+        st.info("No hay servicios ese día en el calendario.")
+        return
+
+    guardadas = {a.get("Event ID"): a for a in tabla("Asignaciones")}
+    gente = personal()
+    st.caption(f"{DIAS[dia.weekday()]} {dia.day} {MESES[dia.month - 1]} · {len(servicios)} servicios. "
+               "En cada servicio elige primero a la **coordinadora** y después al resto.")
+
+    # choferes por camioneta
+    chofer_de = {}
+    caja = st.expander("🚐 Choferes de cada camioneta")
+    for cam in CAMIONETAS:
+        c = caja
+        prev = next((a.get("Chofer") for a in guardadas.values()
+                     if a.get("Camioneta") == cam and a.get("Fecha servicio") == dia.isoformat()), "")
+        ops = [""] + choferes()
+        chofer_de[cam] = c.selectbox(cam, ops, index=ops.index(prev) if prev in ops else 0,
+                                     format_func=lambda x: x or "— sin chofer —", key=f"pl_ch_{dia}_{cam}")
+
+    plan = []
+    for s in servicios:
+        a = guardadas.get(s.event_id, {})
+        kp, kc = f"pl_p_{s.event_id}", f"pl_c_{s.event_id}"
+        if kp not in st.session_state:
+            st.session_state[kp] = [x.strip() for x in str(a.get("Personal", "")).split(",") if x.strip() in gente]
+        if kc not in st.session_state and a.get("Camioneta") in CAMIONETAS:
+            st.session_state[kc] = a.get("Camioneta")
+        with st.container(border=True):
+            st.markdown(md(f"**{hhmm(s.inicio)} · {etiqueta(s)}**"))
+            if s.direccion:
+                st.caption(md(f"📍 {s.direccion}"))
+            personas = st.multiselect("Personal", gente, key=kp, placeholder="Coordinadora y equipo")
+            cam = st.segmented_control("Camioneta", CAMIONETAS, key=kc)
+        plan.append({"s": s, "personas": personas, "cam": cam})
+
+    # avisos
+    cuenta: dict[str, list[str]] = {}
+    for p in plan:
+        for x in p["personas"]:
+            cuenta.setdefault(x, []).append(p["s"].cliente)
+    dobles = {k: v for k, v in cuenta.items() if len(v) > 1}
+    if dobles:
+        st.warning("Personas en más de un servicio: " +
+                   "; ".join(f"{k} ({', '.join(v)})" for k, v in dobles.items()))
+    sin = [p["s"].cliente for p in plan if not p["personas"] and (p["s"].codigos[:1] or [""])[0] not in ("ENT", "REC", "TAP", "ENTTAP")]
+    st.caption(f"👥 {len(cuenta)} personas asignadas · sin personal: {', '.join(sin) or 'ninguno'}")
+
+    if st.button("💾 Guardar plan", type="primary", width="stretch"):
+        gg = google()
+        with st.spinner("Guardando…"):
+            for p in plan:
+                s = p["s"]
+                datos = {"Fecha servicio": dia.isoformat(), "Event ID": s.event_id, "Cliente": s.cliente,
+                         "Servicio": etiqueta(s), "Personal": ", ".join(p["personas"]),
+                         "Coordinadora": p["personas"][0] if p["personas"] else "",
+                         "Camioneta": p["cam"] or "", "Chofer": chofer_de.get(p["cam"] or "", ""),
+                         "Registró": usuario, "Registrado": datetime.now(TZ).strftime("%Y-%m-%d %H:%M")}
+                previo = guardadas.get(s.event_id)
+                if previo:
+                    gg.actualizar(SHEET_ID, "Asignaciones", previo["_fila"],
+                                  {k: v for k, v in datos.items() if k != "Event ID"})
+                else:
+                    gg.agregar(SHEET_ID, "Asignaciones", datos)
+        refrescar()
+        st.success("Plan guardado.")
+
+    st.divider()
+    st.markdown("#### Mensajes para copiar")
+    # 1) equipo
+    equipo = "\n\n".join(f"{etiqueta(p['s'])}\n\n" + "\n".join(p["personas"])
+                          for p in plan if p["personas"])
+    if equipo:
+        bloque_copiar("1 · Equipo por servicio (grupo de operaciones)", equipo, "eq")
+    # 2) camionetas
+    lineas = []
+    for cam in CAMIONETAS:
+        mios = [p for p in plan if p["cam"] == cam]
+        if not mios:
+            continue
+        lineas.append(f"🚐 *{cam}*" + (f" – {chofer_de[cam]}" if chofer_de.get(cam) else ""))
+        for p in mios:
+            lineas.append(f"• {hhmm(p['s'].inicio)} {etiqueta(p['s'])}: {', '.join(p['personas']) or '—'}")
+        lineas.append("")
+    if lineas:
+        bloque_copiar("2 · Equipo en cada camioneta", "\n".join(lineas).strip(), "cam")
+    # 3) ruta de cada chofer
+    for cam in CAMIONETAS:
+        mios = [p for p in plan if p["cam"] == cam]
+        if not mios:
+            continue
+        txt = [f"Ruta {cam} – {DIAS[dia.weekday()]} {dia.day} {MESES[dia.month - 1]}", ""]
+        for n, p in enumerate(mios, 1):
+            s = p["s"]
+            txt.append(f"{n}) {hhmm(s.inicio)} {etiqueta(s)}")
+            if s.direccion:
+                txt.append(f"📍 {s.direccion}")
+                txt.append(maps_lugar(s.direccion))
+            if p["personas"]:
+                txt.append(f"👥 {', '.join(p['personas'])}")
+            txt.append("")
+        ruta = maps_ruta([p["s"].direccion for p in mios])
+        if ruta and len(mios) > 1:
+            txt.append(f"🗺️ Ruta completa: {ruta}")
+        bloque_copiar(f"3 · Ruta para el chofer de {cam}" + (f" ({chofer_de[cam]})" if chofer_de.get(cam) else ""),
+                      "\n".join(txt).strip(), f"ruta_{cam}")
+    # 4) links de coordinadoras
+    links = [f"{p['personas'][0]} – {etiqueta(p['s'])}:\n"
+             f"{enlaces.crear_link(APP_URL, LINK_SECRET, p['s'].event_id, dia)}" for p in plan if p["personas"]]
+    if links:
+        with st.expander("Links de las coordinadoras"):
+            st.code("\n\n".join(links), language=None, wrap_lines=True)
 
 
 def vista_agenda(usuario: str) -> None:

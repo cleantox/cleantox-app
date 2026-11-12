@@ -203,6 +203,8 @@ def parsear_titulo(titulo: str) -> tuple[str, list[str], str]:
         i += 1
     nombre = " ".join(tokens[i:])
     nombre = re.sub(r"\s*\d{1,2}(:\d{2})?\s*(a\.?\s?m\.?|p\.?\s?m\.?|hrs?)\.?", " ", nombre, flags=re.I)
+    nombre = re.sub(r"\s*\b\d{1,2}\s?:\s?\d{2}\b", " ", nombre)            # "9:00", "11 :30" sin a.m.
+    nombre = re.sub(r"(\s+\d{1,2})+\s*$", "", nombre)                         # "Diego Chavez 10"
     nombre = re.sub(r"[^\w\s.'\-áéíóúñÁÉÍÓÚÑüÜ]", "", nombre)
     nombre = " ".join(nombre.split()).title() if nombre.islower() else " ".join(nombre.split())
     # Palabras en MAYÚSCULAS al final del nombre son notas (p.ej. "PUNTUAL")
