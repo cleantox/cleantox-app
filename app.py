@@ -24,6 +24,7 @@ import enlaces
 import google_api as g
 import negocio
 from agenda import agenda_semanal
+import rutas
 from firma import recuadro_firma
 from parser_servicios import es_servicio, parsear_evento
 
@@ -902,6 +903,47 @@ def bloque_copiar(titulo: str, texto: str, key: str) -> None:
     st.link_button("Abrir en WhatsApp", "https://wa.me/?text=" + urllib.parse.quote(texto), width="stretch")
 
 
+CUPO_DEFECTO = {"Avanza": 6, "Hyundai 1": 9, "Hyundai 2": 9}
+CODIGOS_TAPETE = {"ENT", "REC", "TAP", "ENTTAP", "RECTAP", "RECOLECCION", "RECOLECCIÓN"}
+
+
+def es_tapete(s) -> bool:
+    return bool(s.codigos) and s.codigos[0].upper() in CODIGOS_TAPETE
+
+
+def es_lavado(s) -> bool:
+    return bool(s.codigos) and s.codigos[0].upper().startswith(("LAV", "ASP", "VAP", "TEF", "SAN"))
+
+
+def ubicar(direcciones: list[str]) -> dict[str, tuple[float, float] | None]:
+    """Coordenadas de cada dirección; usa lo ya guardado en 'Ubicaciones' y busca lo que falte."""
+    guardadas = {f.get("Dirección", ""): f for f in tabla("Ubicaciones")}
+    res, nuevas = {}, []
+    for d in direcciones:
+        f = guardadas.get(d)
+        if f and f.get("Lat") not in ("", None):
+            res[d] = (g.numero(f["Lat"]), g.numero(f["Lon"]))
+        elif f:
+            res[d] = None                      # ya se intentó y no se encontró
+        else:
+            nuevas.append(d)
+    if nuevas:
+        gg = google()
+        barra = st.progress(0.0, text="Ubicando direcciones en el mapa…")
+        for i, d in enumerate(nuevas, 1):
+            c, fuente = rutas.geocodificar(d)
+            res[d] = c
+            try:
+                gg.agregar(SHEET_ID, "Ubicaciones", {"Dirección": d, "Lat": c[0] if c else "",
+                                                     "Lon": c[1] if c else "", "Fuente": fuente})
+            except Exception:
+                pass
+            barra.progress(i / len(nuevas), text=f"Ubicando direcciones… {i}/{len(nuevas)}")
+        barra.empty()
+        refrescar()
+    return res
+
+
 def vista_plan(usuario: str) -> None:
     try:
         por_defecto = date.fromisoformat(st.query_params.get("dia", "")) if st.query_params.get("dia") \
@@ -943,6 +985,36 @@ def vista_plan(usuario: str) -> None:
                "1ª parada, el segundo la 2ª, etc. Para cambiar el orden, quita el servicio (✕) y vuelve a agregarlo.")
     por_id = {p["s"].event_id: p for p in plan}
     nombre_parada = lambda eid: f"{hhmm(por_id[eid]['s'].inicio)} {etiqueta(por_id[eid]['s'])}"
+
+    activas = st.multiselect("Camionetas que salen", CAMIONETAS, default=CAMIONETAS, key=f"pl_act_{dia}")
+    with st.expander("Cupo de cada camioneta (personas sin contar al chofer)"):
+        cupo = {c: int(st.number_input(c, 1, 15, CUPO_DEFECTO.get(c, 9), key=f"pl_cupo_{c}")) for c in CAMIONETAS}
+    if st.button("✨ Sugerir rutas", width="stretch",
+                 help="Reparte los servicios (sin tapetes) por zona y turno. Después puedes ajustar a mano."):
+        candidatos = [p["s"] for p in plan if not es_tapete(p["s"])]
+        coords = ubicar(sorted({s.direccion for s in candidatos if s.direccion}) + [rutas.BODEGA_DIRECCION])
+        base = coords.get(rutas.BODEGA_DIRECCION) or rutas.BODEGA_RESPALDO
+        datos = []
+        for s in candidatos:
+            n = len(st.session_state.get(f"pl_p_{s.event_id}", []))
+            ini = s.inicio.astimezone(TZ) if s.inicio else None
+            datos.append({"id": s.event_id, "pos": coords.get(s.direccion), "nombre": s.cliente,
+                          "hora": ini.hour * 60 + ini.minute if ini else 9 * 60,
+                          "personas": n or (1 if es_lavado(s) else 3)})
+        sug, avisos = rutas.sugerir(datos, activas, cupo, base)
+        st.session_state["pl_sugerencia"] = {"dia": dia.isoformat(), "rutas": sug, "avisos": avisos}
+        st.rerun()
+    sug = st.session_state.get("pl_sugerencia")
+    if sug and sug.get("dia") == dia.isoformat():
+        if sug.get("rutas") is not None:
+            for cam in CAMIONETAS:
+                st.session_state[f"pl_r_{dia}_{cam}"] = list(sug["rutas"].get(cam, []))
+            sug["rutas"] = None              # ya se aplicó; los avisos se quedan visibles
+        with st.expander("✨ Rutas sugeridas: revisa y ajusta", expanded=True):
+            st.caption("Personal sin asignar se calculó como 1 persona en lavados y 3 en limpiezas. "
+                       "Las entregas y recolecciones de tapete no se incluyeron: agrégalas a mano si van en ruta.")
+            for a in sug["avisos"]:
+                st.markdown(md(f"- {a}"))
     for cam in CAMIONETAS:
         kr = f"pl_r_{dia}_{cam}"
         if kr not in st.session_state:
@@ -953,6 +1025,9 @@ def vista_plan(usuario: str) -> None:
     elegidos_en = {cam: list(st.session_state.get(f"pl_r_{dia}_{cam}", [])) for cam in CAMIONETAS}
     chofer_de = {}
     for cam in CAMIONETAS:
+        if cam not in activas:
+            st.session_state[f"pl_r_{dia}_{cam}"] = []
+            continue
         otros = {e for c, lst in elegidos_en.items() if c != cam for e in lst}
         opciones = [e for e in por_id if e not in otros]
         kr = f"pl_r_{dia}_{cam}"
@@ -982,10 +1057,12 @@ def vista_plan(usuario: str) -> None:
     for p in plan:
         for x in p["personas"]:
             cuenta.setdefault(x, []).append(p["s"].cliente)
-    dobles = {k: v for k, v in cuenta.items() if len(v) > 1}
+    tipo_de = {p["s"].cliente: es_lavado(p["s"]) for p in plan}
+    dobles = {k: v for k, v in cuenta.items()
+              if len(v) > 1 and (not all(tipo_de.get(c) for c in v) or len(v) > 3)}
     if dobles:
-        st.warning("Personas en más de un servicio: " +
-                   "; ".join(f"{k} ({', '.join(v)})" for k, v in dobles.items()))
+        st.warning("Revisa: estas personas quedaron en una limpiezas/pre mudanza/post obra y otro servicio, "
+                   "o en más de 3 lavados: " + "; ".join(f"{k} ({', '.join(v)})" for k, v in dobles.items()))
     sin = [p["s"].cliente for p in plan if not p["personas"] and (p["s"].codigos[:1] or [""])[0] not in ("ENT", "REC", "TAP", "ENTTAP")]
     st.caption(f"👥 {len(cuenta)} personas asignadas · sin personal: {', '.join(sin) or 'ninguno'}")
 

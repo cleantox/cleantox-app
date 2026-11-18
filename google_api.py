@@ -48,6 +48,7 @@ TABLAS = {
     "Recompra": ["Teléfono", "Cliente", "Contactado", "Por", "Notas"],
     "Alertas enviadas": ["Event ID", "Tipo", "Fecha"],
     "Borradores cierre": ["Event ID", "Datos", "Actualizado"],
+    "Ubicaciones": ["Dirección", "Lat", "Lon", "Fuente", "Registrado"],
     "Asignaciones": ["Fecha servicio", "Event ID", "Cliente", "Servicio", "Personal", "Coordinadora",
                      "Camioneta", "Chofer", "Registró", "Registrado", "Parada"],
 }
