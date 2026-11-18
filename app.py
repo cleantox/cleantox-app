@@ -924,32 +924,58 @@ def vista_plan(usuario: str) -> None:
     st.caption(f"{DIAS[dia.weekday()]} {dia.day} {MESES[dia.month - 1]} · {len(servicios)} servicios. "
                "En cada servicio elige primero a la **coordinadora** y después al resto.")
 
-    # choferes por camioneta
-    chofer_de = {}
-    caja = st.expander("🚐 Choferes de cada camioneta")
-    for cam in CAMIONETAS:
-        c = caja
-        prev = next((a.get("Chofer") for a in guardadas.values()
-                     if a.get("Camioneta") == cam and a.get("Fecha servicio") == dia.isoformat()), "")
-        ops = [""] + choferes()
-        chofer_de[cam] = c.selectbox(cam, ops, index=ops.index(prev) if prev in ops else 0,
-                                     format_func=lambda x: x or "— sin chofer —", key=f"pl_ch_{dia}_{cam}")
-
     plan = []
     for s in servicios:
         a = guardadas.get(s.event_id, {})
-        kp, kc = f"pl_p_{s.event_id}", f"pl_c_{s.event_id}"
+        kp = f"pl_p_{s.event_id}"
         if kp not in st.session_state:
             st.session_state[kp] = [x.strip() for x in str(a.get("Personal", "")).split(",") if x.strip() in gente]
-        if kc not in st.session_state and a.get("Camioneta") in CAMIONETAS:
-            st.session_state[kc] = a.get("Camioneta")
         with st.container(border=True):
             st.markdown(md(f"**{hhmm(s.inicio)} · {etiqueta(s)}**"))
             if s.direccion:
                 st.caption(md(f"📍 {s.direccion}"))
             personas = st.multiselect("Personal", gente, key=kp, placeholder="Coordinadora y equipo")
-            cam = st.segmented_control("Camioneta", CAMIONETAS, key=kc)
-        plan.append({"s": s, "personas": personas, "cam": cam})
+        plan.append({"s": s, "personas": personas, "cam": None, "parada": None})
+
+    # --- Rutas: por camioneta, el chofer y las paradas en el orden en que se tocan
+    st.markdown("#### 🗺️ Rutas")
+    st.caption("En cada camioneta toca los servicios **en el orden de la ruta**: el primero que toques es la "
+               "1ª parada, el segundo la 2ª, etc. Para cambiar el orden, quita el servicio (✕) y vuelve a agregarlo.")
+    por_id = {p["s"].event_id: p for p in plan}
+    nombre_parada = lambda eid: f"{hhmm(por_id[eid]['s'].inicio)} {etiqueta(por_id[eid]['s'])}"
+    for cam in CAMIONETAS:
+        kr = f"pl_r_{dia}_{cam}"
+        if kr not in st.session_state:
+            mias = [a for a in guardadas.values() if a.get("Camioneta") == cam and a.get("Event ID") in por_id]
+            mias.sort(key=lambda a: (g.numero(a.get("Parada")) or 99,
+                                     por_id[a["Event ID"]]["s"].inicio or datetime.max.replace(tzinfo=TZ)))
+            st.session_state[kr] = [a["Event ID"] for a in mias]
+    elegidos_en = {cam: list(st.session_state.get(f"pl_r_{dia}_{cam}", [])) for cam in CAMIONETAS}
+    chofer_de = {}
+    for cam in CAMIONETAS:
+        otros = {e for c, lst in elegidos_en.items() if c != cam for e in lst}
+        opciones = [e for e in por_id if e not in otros]
+        kr = f"pl_r_{dia}_{cam}"
+        st.session_state[kr] = [e for e in st.session_state.get(kr, []) if e in opciones]
+        with st.container(border=True):
+            kch = f"pl_ch_{dia}_{cam}"
+            if kch not in st.session_state:
+                prev = next((a.get("Chofer") for a in guardadas.values()
+                             if a.get("Camioneta") == cam and a.get("Fecha servicio") == dia.isoformat()), "")
+                st.session_state[kch] = prev if prev in ([""] + choferes()) else ""
+            c1, c2 = st.columns([1, 2], vertical_alignment="center")
+            c1.markdown(f"**🚐 {cam}**")
+            chofer_de[cam] = c2.selectbox("Chofer", [""] + choferes(), key=kch, label_visibility="collapsed",
+                                          format_func=lambda x: x or "— sin chofer —")
+            ruta = st.multiselect("Paradas en orden", opciones, key=kr, format_func=nombre_parada,
+                                  placeholder="Toca la 1ª parada, luego la 2ª…")
+            if ruta:
+                st.caption("  \n".join(md(f"**{n}ª** · {nombre_parada(e)}") for n, e in enumerate(ruta, 1)))
+            for n, e in enumerate(ruta, 1):
+                por_id[e]["cam"], por_id[e]["parada"] = cam, n
+    sin_ruta = [p["s"].cliente for p in plan if not p["cam"]]
+    if sin_ruta:
+        st.caption(md("Sin camioneta: " + ", ".join(sin_ruta)))
 
     # avisos
     cuenta: dict[str, list[str]] = {}
@@ -972,6 +998,7 @@ def vista_plan(usuario: str) -> None:
                          "Servicio": etiqueta(s), "Personal": ", ".join(p["personas"]),
                          "Coordinadora": p["personas"][0] if p["personas"] else "",
                          "Camioneta": p["cam"] or "", "Chofer": chofer_de.get(p["cam"] or "", ""),
+                         "Parada": p["parada"] or "",
                          "Registró": usuario, "Registrado": datetime.now(TZ).strftime("%Y-%m-%d %H:%M")}
                 previo = guardadas.get(s.event_id)
                 if previo:
@@ -992,24 +1019,24 @@ def vista_plan(usuario: str) -> None:
     # 2) camionetas
     lineas = []
     for cam in CAMIONETAS:
-        mios = [p for p in plan if p["cam"] == cam]
+        mios = sorted([p for p in plan if p["cam"] == cam], key=lambda p: p["parada"])
         if not mios:
             continue
         lineas.append(f"🚐 *{cam}*" + (f" – {chofer_de[cam]}" if chofer_de.get(cam) else ""))
         for p in mios:
-            lineas.append(f"• {hhmm(p['s'].inicio)} {etiqueta(p['s'])}: {', '.join(p['personas']) or '—'}")
+            lineas.append(f"{p['parada']}) {hhmm(p['s'].inicio)} {etiqueta(p['s'])}: {', '.join(p['personas']) or '—'}")
         lineas.append("")
     if lineas:
         bloque_copiar("2 · Equipo en cada camioneta", "\n".join(lineas).strip(), "cam")
     # 3) ruta de cada chofer
     for cam in CAMIONETAS:
-        mios = [p for p in plan if p["cam"] == cam]
+        mios = sorted([p for p in plan if p["cam"] == cam], key=lambda p: p["parada"])
         if not mios:
             continue
         txt = [f"Ruta {cam} – {DIAS[dia.weekday()]} {dia.day} {MESES[dia.month - 1]}", ""]
         for n, p in enumerate(mios, 1):
             s = p["s"]
-            txt.append(f"{n}) {hhmm(s.inicio)} {etiqueta(s)}")
+            txt.append(f"{n}ª parada · {hhmm(s.inicio)} {etiqueta(s)}")
             if s.direccion:
                 txt.append(f"📍 {s.direccion}")
                 txt.append(maps_lugar(s.direccion))

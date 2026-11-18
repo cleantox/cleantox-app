@@ -49,7 +49,7 @@ TABLAS = {
     "Alertas enviadas": ["Event ID", "Tipo", "Fecha"],
     "Borradores cierre": ["Event ID", "Datos", "Actualizado"],
     "Asignaciones": ["Fecha servicio", "Event ID", "Cliente", "Servicio", "Personal", "Coordinadora",
-                     "Camioneta", "Chofer", "Registró", "Registrado"],
+                     "Camioneta", "Chofer", "Registró", "Registrado", "Parada"],
 }
 REPORTADO = "Reportado por coordinadora"
 CONFIRMADO = "Confirmado"
