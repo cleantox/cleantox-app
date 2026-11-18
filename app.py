@@ -921,12 +921,13 @@ def ubicar(direcciones: list[str]) -> dict[str, tuple[float, float] | None]:
     res, nuevas = {}, []
     for d in direcciones:
         f = guardadas.get(d)
-        if f and f.get("Lat") not in ("", None):
-            res[d] = (g.numero(f["Lat"]), g.numero(f["Lon"]))
-        elif f:
-            res[d] = None                      # ya se intentó y no se encontró
+        c = (g.numero(f["Lat"]), g.numero(f["Lon"])) if f and f.get("Lat") not in ("", None) else None
+        if c and rutas.en_zona(c):
+            res[d] = c
+        elif f and f.get("Fuente") == rutas.FALLO:
+            res[d] = None                      # ya se intentó con la versión actual y no se encontró
         else:
-            nuevas.append(d)
+            nuevas.append(d)                   # nueva, fuera de zona o falló con la versión anterior
     if nuevas:
         gg = google()
         barra = st.progress(0.0, text="Ubicando direcciones en el mapa…")
@@ -934,8 +935,12 @@ def ubicar(direcciones: list[str]) -> dict[str, tuple[float, float] | None]:
             c, fuente = rutas.geocodificar(d)
             res[d] = c
             try:
-                gg.agregar(SHEET_ID, "Ubicaciones", {"Dirección": d, "Lat": c[0] if c else "",
-                                                     "Lon": c[1] if c else "", "Fuente": fuente})
+                datos_u = {"Dirección": d, "Lat": c[0] if c else "", "Lon": c[1] if c else "", "Fuente": fuente}
+                previo = guardadas.get(d)
+                if previo:
+                    gg.actualizar(SHEET_ID, "Ubicaciones", previo["_fila"], datos_u)
+                else:
+                    gg.agregar(SHEET_ID, "Ubicaciones", datos_u)
             except Exception:
                 pass
             barra.progress(i / len(nuevas), text=f"Ubicando direcciones… {i}/{len(nuevas)}")

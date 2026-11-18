@@ -41,16 +41,45 @@ def _coords_en_texto(texto: str) -> tuple[float, float] | None:
     return None
 
 
+# Zona metropolitana (CDMX + municipios cercanos del Edo. de México)
+ZONA = {"lon_min": -99.50, "lat_min": 19.05, "lon_max": -98.90, "lat_max": 19.80}
+FALLO = "no se encontró v2"          # las que fallaron con la versión anterior se vuelven a intentar
+
+
+def en_zona(c: tuple[float, float] | None) -> bool:
+    return bool(c) and ZONA["lat_min"] <= c[0] <= ZONA["lat_max"] and ZONA["lon_min"] <= c[1] <= ZONA["lon_max"]
+
+
 def _limpiar(direccion: str) -> str:
-    d = re.sub(r"https?://\S+", " ", direccion)
-    d = re.sub(r"\b(depto|dpto|departamento|int(erior)?|piso|casa|torre|edificio|edif|lote|mz|manzana)\b\.?\s*\S*",
-               " ", d, flags=re.I)
+    d = _sin_repetir(re.sub(r"https?://\S+", " ", direccion).strip())
+    d = re.sub(r"\(.*?\)", " ", d)                                   # notas entre paréntesis
+    d = re.sub(r"\bc\.?\s?p\.?\s*(\d{5})", r", \1", d, flags=re.I)  # "CP53109" -> ", 53109"
+    d = d.replace("#", " ").replace(";", ",")
+    d = re.sub(r"\b(depto|dpto|departamento|int(erior)?|piso|casa|torre|tore|edificio|edif|lote|mz|manzana|"
+               r"privada|priv)\b\.?\s*[\w-]*", " ", d, flags=re.I)
     d = re.sub(r"\s+", " ", d).strip(" ,.")
+    return d.strip(" ,.")
+
+
+def _sin_repetir(d: str) -> str:
+    """'Desierto 5909 Col. AlcantarillaDesierto 5909 Col. Alcantarilla' -> una sola vez."""
+    if len(d) > 30:
+        k = d.lower().find(d[:15].lower(), 10)
+        if k > 0:
+            return d[:k]
     return d
 
 
+def _colonia(direccion: str) -> str:
+    d = re.sub(r"\(.*?\)", " ", _sin_repetir(direccion))
+    m = re.findall(r"\b(?:col\.?|colonia|fracc?\.?|fraccionamiento|residencial|barrio|unidad)\s+([^,.;()]+)",
+                   d, flags=re.I)
+    return m[-1].strip() if m else ""
+
+
 def _nominatim(q: str = "", **params) -> tuple[float, float] | None:
-    p = {"format": "json", "limit": "1", "countrycodes": "mx"}
+    p = {"format": "json", "limit": "1", "countrycodes": "mx", "bounded": "1",
+         "viewbox": f"{ZONA['lon_min']},{ZONA['lat_max']},{ZONA['lon_max']},{ZONA['lat_min']}"}
     if q:
         p["q"] = q
     p.update(params)
@@ -58,14 +87,31 @@ def _nominatim(q: str = "", **params) -> tuple[float, float] | None:
         _, txt = _get("https://nominatim.openstreetmap.org/search?" + urllib.parse.urlencode(p))
         r = json.loads(txt)
         if r:
-            return float(r[0]["lat"]), float(r[0]["lon"])
+            c = (float(r[0]["lat"]), float(r[0]["lon"]))
+            return c if en_zona(c) else None
+    except Exception:
+        pass
+    return None
+
+
+def _photon(q: str) -> tuple[float, float] | None:
+    """Segundo buscador gratuito (tolera mejor faltas de ortografía)."""
+    p = {"q": q, "limit": "1", "lat": "19.40", "lon": "-99.20",
+         "bbox": f"{ZONA['lon_min']},{ZONA['lat_min']},{ZONA['lon_max']},{ZONA['lat_max']}"}
+    try:
+        _, txt = _get("https://photon.komoot.io/api/?" + urllib.parse.urlencode(p))
+        f = json.loads(txt).get("features") or []
+        if f:
+            lon, lat = f[0]["geometry"]["coordinates"][:2]
+            c = (float(lat), float(lon))
+            return c if en_zona(c) else None
     except Exception:
         pass
     return None
 
 
 def geocodificar(direccion: str) -> tuple[tuple[float, float] | None, str]:
-    """Devuelve ((lat, lon), fuente) o (None, motivo)."""
+    """Devuelve ((lat, lon), fuente) o (None, motivo). Solo acepta puntos dentro de la zona metropolitana."""
     if not direccion:
         return None, "sin dirección"
     c = _coords_en_texto(direccion)
@@ -76,27 +122,40 @@ def geocodificar(direccion: str) -> tuple[tuple[float, float] | None, str]:
         try:
             final, cuerpo = _get(link.group(0))
             c = _coords_en_texto(final) or _coords_en_texto(cuerpo[:20000])
-            if c:
+            if en_zona(c):
                 return c, "liga de Maps"
         except Exception:
             pass
     limpia = _limpiar(direccion)
-    intentos = [limpia + ", México"]
     partes = [x.strip() for x in limpia.split(",") if x.strip()]
+    calle = re.sub(r"\s+\d+\w?$", "", partes[0]) if partes else ""     # calle sin número
+    colonia = _colonia(direccion)
+    intentos = [limpia]
     if len(partes) > 2:
-        intentos.append(", ".join(partes[1:]) + ", México")      # sin la calle
+        intentos.append(", ".join(partes[1:]))
+    if calle and colonia:
+        intentos.append(f"{calle}, {colonia}")
     for q in intentos:
-        c = _nominatim(q)
+        c = _nominatim(q + ", México")
         time.sleep(1.1)                         # política de uso de OpenStreetMap
         if c:
             return c, "openstreetmap"
-    cp = re.search(r"\b(\d{5})\b", direccion)
+    for q in intentos:
+        c = _photon(q)
+        if c:
+            return c, "photon"
+    if colonia:
+        c = _nominatim(colonia + ", México") or _photon(colonia)
+        time.sleep(1.1)
+        if c:
+            return c, "colonia (aprox.)"
+    cp = re.search(r"\b(\d{5})\b", limpia)
     if cp:
         c = _nominatim(postalcode=cp.group(1))
         time.sleep(1.1)
         if c:
-            return c, "código postal"
-    return None, "no se encontró"
+            return c, "código postal (aprox.)"
+    return None, FALLO
 
 
 # ------------------------------------------------------------------ cálculo
