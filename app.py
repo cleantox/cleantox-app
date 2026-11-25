@@ -145,6 +145,37 @@ def personal() -> list[str]:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
+def telefonos_personal() -> dict[str, str]:
+    """Nombre -> celular a 10 dígitos (columna 'Teléfono' de la pestaña Personal)."""
+    res = {}
+    for f in google().leer_tabla(SHEET_ID, "Personal"):
+        nombre = str(f.get("Nombre", "")).strip()
+        tel = re.sub(r"\D", "", str(f.get("Teléfono", "")))
+        if tel.startswith("521") and len(tel) == 13:
+            tel = tel[3:]
+        elif tel.startswith("52") and len(tel) == 12:
+            tel = tel[2:]
+        if nombre and len(tel) == 10:
+            res[nombre] = tel
+    return res
+
+
+def mensaje_coordinadora(coord: str, dia: date, servicio: str, hora: str, direccion: str,
+                         equipo: list[str], camioneta: str, chofer: str, link: str) -> str:
+    primer = coord.split()[0] if coord else ""
+    dias = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+    cuando = f"{'Mañana' if dia == hoy() + timedelta(days=1) else 'El'} {dias[dia.weekday()]} {dia.day}"
+    lineas = [f"Hola {primer} 👋 {cuando} eres coordinadora en *{servicio}* a las *{hora}*."]
+    if direccion:
+        lineas.append(f"📍 {direccion}")
+    lineas.append(f"👥 Equipo: {', '.join(equipo) if equipo else 'solo tú'}")
+    if camioneta:
+        lineas.append(f"🚐 Te lleva: {camioneta}" + (f" ({chofer})" if chofer else ""))
+    lineas.append(f"Marca tu llegada y salida aquí: {link}")
+    return "\n".join(lineas)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def tareas_config() -> dict[str, list[str]]:
     out: dict[str, list[str]] = {}
     for f in google().leer_tabla(SHEET_ID, "Tareas por servicio"):
@@ -1130,12 +1161,26 @@ def vista_plan(usuario: str) -> None:
             txt.append(f"🗺️ Ruta completa: {ruta}")
         bloque_copiar(f"3 · Ruta para el chofer de {cam}" + (f" ({chofer_de[cam]})" if chofer_de.get(cam) else ""),
                       "\n".join(txt).strip(), f"ruta_{cam}")
-    # 4) links de coordinadoras
-    links = [f"{p['personas'][0]} – {etiqueta(p['s'])}:\n"
-             f"{enlaces.crear_link(APP_URL, LINK_SECRET, p['s'].event_id, dia)}" for p in plan if p["personas"]]
-    if links:
-        with st.expander("Links de las coordinadoras"):
-            st.code("\n\n".join(links), language=None, wrap_lines=True)
+    # 4) mensaje a cada coordinadora (un toque: abre WhatsApp con el mensaje escrito)
+    con_coord = [p for p in plan if p["personas"]]
+    if con_coord:
+        st.markdown("**4 · Mensaje a cada coordinadora**")
+        st.caption("Abre esta pantalla en el celular de operaciones. Cada botón abre el chat de la coordinadora "
+                   "con su mensaje listo: solo toca enviar.")
+        tels = telefonos_personal()
+        for p in con_coord:
+            s, coord = p["s"], p["personas"][0]
+            link = enlaces.crear_link(APP_URL, LINK_SECRET, s.event_id, dia)
+            texto = mensaje_coordinadora(coord, dia, etiqueta(s), hhmm(s.inicio), s.direccion,
+                                         p["personas"][1:], p["cam"] or "", chofer_de.get(p["cam"] or "", ""), link)
+            tel = tels.get(coord.strip())
+            if tel:
+                st.link_button(f"📲 Enviar a {coord.strip()} · {hhmm(s.inicio)} {s.cliente}",
+                               f"https://wa.me/52{tel}?text=" + urllib.parse.quote(texto), width="stretch")
+            else:
+                st.warning(f"Falta el teléfono de {coord.strip()} en la pestaña Personal (columna Teléfono).")
+                st.link_button(f"📲 Elegir chat para {coord.strip()} · {s.cliente}",
+                               "https://wa.me/?text=" + urllib.parse.quote(texto), width="stretch")
 
 
 def vista_agenda(usuario: str) -> None:
